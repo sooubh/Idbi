@@ -16,7 +16,6 @@ import 'package:student_fin_os/providers/auth_providers.dart';
 import 'package:student_fin_os/providers/aws_providers.dart';
 import 'package:student_fin_os/core/utils/brand_styles.dart';
 import 'package:student_fin_os/core/utils/dummy_data.dart';
-import 'package:student_fin_os/features/dashboard/ui/spending_modules_screen.dart';
 import 'package:student_fin_os/providers/risk_profile_provider.dart';
 import 'package:student_fin_os/features/profile/ui/risk_profile_screen.dart';
 import 'package:student_fin_os/features/assistant/ui/chat_assistant_screen.dart';
@@ -488,8 +487,8 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                   ),
                   const SizedBox(height: 18),
                   const SectionHeader(
-                    title: 'AI Quick Insights',
-                    subtitle: 'Quick actions.',
+                    title: 'AI Wealth Actions',
+                    subtitle: 'Quick investment prompts.',
                   ),
                   const SizedBox(height: 10),
                   SizedBox(
@@ -499,14 +498,14 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                       children: <Widget>[
                         _AiStrategyCard(
                           icon: Icons.pie_chart_outline,
-                          title: '50/30/20',
-                          description: 'Set clear spend caps.',
+                          title: 'Rebalance portfolio',
+                          description: 'Optimize asset weights.',
                           color: Colors.blueAccent,
                           onTap: () {
                             Navigator.of(context).push(
                               MaterialPageRoute(
                                 builder: (_) => const ChatAssistantScreen(
-                                  initialMessage: 'Can we discuss setting up a 50/30/20 budget based on my recent spending?',
+                                  initialMessage: 'Based on my current investments and risk profile, how should I rebalance my portfolio?',
                                 ),
                               ),
                             );
@@ -515,14 +514,14 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                         const SizedBox(width: 12),
                         _AiStrategyCard(
                           icon: Icons.savings_outlined,
-                          title: 'Auto-save 10%',
-                          description: 'Grow goals automatically.',
+                          title: 'Check Diversification',
+                          description: 'Am I diversified enough?',
                           color: Colors.green,
                           onTap: () {
                             Navigator.of(context).push(
                               MaterialPageRoute(
                                 builder: (_) => const ChatAssistantScreen(
-                                  initialMessage: 'How can I automate 10% of my income into an emergency fund? What are the best options?',
+                                  initialMessage: 'Can you analyze my current investment holdings and tell me if I am diversified enough?',
                                 ),
                               ),
                             );
@@ -546,86 +545,6 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                         ),
                       ],
                     ),
-                  ),
-                  const SizedBox(height: 18),
-                  InkWell(
-                    onTap: () {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => const LearningModulesScreen(),
-                        ),
-                      );
-                    },
-                    borderRadius: BorderRadius.circular(16),
-                    child: Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          colors: [
-                            Theme.of(context).colorScheme.primary,
-                            Theme.of(context).colorScheme.secondary,
-                          ],
-                        ),
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            Icons.school,
-                            size: 32,
-                            color: Theme.of(context).colorScheme.onPrimary,
-                          ),
-                          const SizedBox(width: 16),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'Smart Spending Hub',
-                                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                                        color: Theme.of(context).colorScheme.onPrimary,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  'Save money on Amazon, Zomato & more',
-                                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                        color: Theme.of(context).colorScheme.onPrimary.withValues(alpha: 0.9),
-                                      ),
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Icon(
-                            Icons.arrow_forward_ios,
-                            size: 16,
-                            color: Theme.of(context).colorScheme.onPrimary,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(Icons.info_outline, size: 16, color: Theme.of(context).colorScheme.secondary),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Lowers burn rate & improves AI predictions',
-                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                color: Theme.of(context).colorScheme.onSurfaceVariant,
-                                fontStyle: FontStyle.italic,
-                              ),
-                        ),
-                      ),
-                    ],
                   ),
                   const SizedBox(height: 18),
                   SectionHeader(
@@ -2090,7 +2009,7 @@ class _HomeDetailsSheet extends StatelessWidget {
 
     if (suggestions.length < 3) {
       suggestions.add(
-        'Before each purchase, ask FinMate if it fits your weekly plan.',
+        'Before each purchase, ask WealthQuest AI if it fits your weekly plan.',
       );
     }
 

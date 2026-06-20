@@ -199,7 +199,7 @@ class _AppShellScreenState extends ConsumerState<AppShellScreen> {
               }
             },
             decoration: const InputDecoration(
-              hintText: 'Ask FinMate anything...',
+              hintText: 'Ask WealthQuest AI anything...',
               prefixIcon: Icon(Icons.search, size: 20),
               border: InputBorder.none,
               contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),

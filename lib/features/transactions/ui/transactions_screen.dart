@@ -47,21 +47,6 @@ class TransactionsScreen extends ConsumerWidget {
                       label: Text(l10n.addTransaction),
                     ),
                   ),
-                  const SizedBox(width: 10),
-                  AnimatedScale(
-                    scale: accounts.isEmpty ? 0.98 : 1,
-                    duration: const Duration(milliseconds: 180),
-                    curve: Curves.easeOut,
-                    child: OutlinedButton.icon(
-                      onPressed: accounts.isEmpty
-                          ? null
-                          : () {
-                              _simulateQrEntry(context, ref, accounts.first.id);
-                            },
-                      icon: const Icon(Icons.qr_code_scanner),
-                      label: Text(l10n.quickQrEntry),
-                    ),
-                  ),
                 ],
               ),
               const SizedBox(height: 12),
@@ -140,23 +125,7 @@ class TransactionsScreen extends ConsumerWidget {
     );
   }
 
-  Future<void> _simulateQrEntry(
-    BuildContext context,
-    WidgetRef ref,
-    String accountId,
-  ) async {
-    await ref.read(transactionControllerProvider.notifier).addManualTransaction(
-          title: 'Cafe payment via QR',
-          accountId: accountId,
-          amount: 240,
-          type: TransactionType.expense,
-          category: 'food',
-          tags: const <String>['qr', 'upi'],
-          note: 'QR transaction',
-          source: 'qr',
-          channel: 'upi',
-        );
-  }
+
 
   Future<void> _openCategoryOverrideSheet(
     BuildContext context,

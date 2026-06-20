@@ -79,7 +79,7 @@ class _ChatAssistantScreenState extends ConsumerState<ChatAssistantScreen> {
     if (!hasKey) {
       return Scaffold(
         appBar: AppBar(
-          title: const Text('FinMate'),
+          title: const Text('WealthQuest AI'),
         ),
         body: Container(
           decoration: BoxDecoration(
@@ -127,7 +127,7 @@ class _ChatAssistantScreenState extends ConsumerState<ChatAssistantScreen> {
       appBar: AppBar(
         titleSpacing: 0,
         title: Text(
-          'FinMate',
+          'WealthQuest AI',
           style: Theme.of(context).textTheme.titleMedium?.copyWith(
             fontWeight: FontWeight.w700,
           ),

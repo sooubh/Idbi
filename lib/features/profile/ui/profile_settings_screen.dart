@@ -10,6 +10,7 @@ import 'package:student_fin_os/providers/aws_providers.dart';
 import 'package:student_fin_os/providers/investment_providers.dart';
 import 'package:student_fin_os/providers/risk_profile_provider.dart';
 import 'package:student_fin_os/features/profile/ui/risk_profile_screen.dart';
+import 'package:student_fin_os/features/profile/ui/sdk_simulator_screen.dart';
 import 'package:student_fin_os/core/widgets/gemini_key_manager_sheet.dart';
 
 class ProfileSettingsScreen extends ConsumerWidget {
@@ -42,6 +43,8 @@ class ProfileSettingsScreen extends ConsumerWidget {
           _geminiKeySettingsCard(context, ref),
           const SizedBox(height: 12),
           _quickFeedDemoDataCard(context, ref),
+          const SizedBox(height: 12),
+          _sdkSimulatorCard(context),
           const SizedBox(height: 12),
           Card(
             child: ListTile(
@@ -138,7 +141,7 @@ class ProfileSettingsScreen extends ConsumerWidget {
                   Text(email, style: Theme.of(context).textTheme.bodyMedium),
                   const SizedBox(height: 6),
                   Text(
-                    'Personalized rewards, streaks, and spending habits',
+                    'Smart goal-based investing & wealth planning',
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
                 ],
@@ -447,6 +450,31 @@ class ProfileSettingsScreen extends ConsumerWidget {
       activeSpendDays: activeDates.length,
       summary: summary,
       actionTip: actionTip,
+    );
+  }
+
+  Widget _sdkSimulatorCard(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    return Card(
+      child: ListTile(
+        leading: Icon(
+          Icons.developer_mode_rounded,
+          color: colorScheme.primary,
+        ),
+        title: const Text('Partner Bank SDK Simulator'),
+        subtitle: const Text('Test white-label integration in a simulator shell'),
+        trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+        onTap: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute<void>(
+              builder: (_) => const SdkSimulatorScreen(),
+            ),
+          );
+        },
+      ),
     );
   }
 

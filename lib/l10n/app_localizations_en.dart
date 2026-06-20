@@ -355,7 +355,7 @@ class AppLocalizationsEn extends AppLocalizations {
   String get savingsGoals => 'Savings goals';
 
   @override
-  String get savingsGoalsSubtitle => 'Plan goals without killing daily life';
+  String get savingsGoalsSubtitle => 'Grow your wealth through smart, goal-based SIP investing';
 
   @override
   String get newGoal => 'New goal';

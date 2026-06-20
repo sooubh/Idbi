@@ -355,7 +355,7 @@ class AppLocalizationsHi extends AppLocalizations {
   String get savingsGoals => 'बचत लक्ष्य';
 
   @override
-  String get savingsGoalsSubtitle => 'दैनिक जीवन बिगाड़े बिना लक्ष्य बनाएं';
+  String get savingsGoalsSubtitle => 'स्मार्ट, लक्ष्य-आधारित SIP निवेश के माध्यम से अपनी संपत्ति बढ़ाएं';
 
   @override
   String get newGoal => 'नया लक्ष्य';

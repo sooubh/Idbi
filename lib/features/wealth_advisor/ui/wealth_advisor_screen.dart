@@ -155,7 +155,7 @@ class _WealthAdvisorScreenState extends ConsumerState<WealthAdvisorScreen> {
 
       if (assistantMessages.isEmpty) {
         child = Text(
-          'Namaste! I am FinMate, your personal AI Wealth Advisor. Ask me anything about your budget, savings goals, or transactions, or tap the microphone to start talking!',
+          'Namaste! I am WealthQuest AI, your personal AI Wealth Advisor. Ask me anything about your budget, savings goals, or transactions, or tap the microphone to start talking!',
           style: theme.textTheme.bodyLarge?.copyWith(
             color: colorScheme.onSurface,
             height: 1.4,
@@ -249,7 +249,7 @@ class _WealthAdvisorScreenState extends ConsumerState<WealthAdvisorScreen> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text(
-                      'FinMate AI Advisor',
+                      'WealthQuest AI Advisor',
                       style: theme.textTheme.titleLarge?.copyWith(
                         fontWeight: FontWeight.bold,
                         color: colorScheme.onSurface,
@@ -421,14 +421,14 @@ class _WealthAdvisorScreenState extends ConsumerState<WealthAdvisorScreen> {
                     Icon(Icons.auto_awesome, color: colorScheme.primary),
                     const SizedBox(width: 8),
                     Text(
-                      'FinMate AI Tools & Commands',
+                      'WealthQuest AI Tools & Commands',
                       style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
                     ),
                   ],
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'FinMate can analyze your context and execute tasks in-app when you ask.',
+                  'WealthQuest AI can analyze your context and execute tasks in-app when you ask.',
                   style: theme.textTheme.bodyMedium?.copyWith(color: colorScheme.onSurfaceVariant),
                 ),
                 const SizedBox(height: 20),

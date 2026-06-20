@@ -49,7 +49,7 @@ class AlertsSheet extends StatelessWidget {
                   icon: Icons.trending_up,
                   iconColor: Colors.green,
                   title: "Smart SIP Opportunity",
-                  subtitle: "Your Safe to Spend balance is looking very healthy. Ask FinMate AI how to sweep ₹2,000 into an Index Fund.",
+                  subtitle: "Your Safe to Spend balance is looking very healthy. Ask WealthQuest AI how to sweep ₹2,000 into an Index Fund.",
                   time: '1 day ago',
                 ),
               ],

@@ -355,7 +355,7 @@ class AppLocalizationsMr extends AppLocalizations {
   String get savingsGoals => 'बचत ध्येये';
 
   @override
-  String get savingsGoalsSubtitle => 'दैनंदिन जीवन बिघडवू न देता ध्येय ठरवा';
+  String get savingsGoalsSubtitle => 'स्मार्ट, ध्येय-आधारित एसआयपी गुंतवणुकीद्वारे आपली संपत्ती वाढवा';
 
   @override
   String get newGoal => 'नवे ध्येय';
