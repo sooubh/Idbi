@@ -1,0 +1,1846 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_sound/flutter_sound.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:go_router/go_router.dart';
+import 'package:intl/intl.dart';
+import 'package:logger/logger.dart' show Level;
+import 'package:permission_handler/permission_handler.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:student_fin_os/core/router/app_router.dart';
+import 'package:student_fin_os/core/config/ai_runtime_config.dart';
+import 'package:student_fin_os/models/assistant_models.dart';
+import 'package:student_fin_os/providers/assistant_providers.dart';
+import 'package:student_fin_os/services/assistant_service.dart';
+
+class VoiceAssistantSheet extends ConsumerStatefulWidget {
+  const VoiceAssistantSheet({super.key});
+
+  @override
+  ConsumerState<VoiceAssistantSheet> createState() =>
+      _VoiceAssistantSheetState();
+}
+
+class _VoiceAssistantSheetState extends ConsumerState<VoiceAssistantSheet>
+  with WidgetsBindingObserver {
+  final FlutterSoundRecorder _pcmRecorder = FlutterSoundRecorder(
+    logLevel: Level.warning,
+  );
+  final FlutterSoundPlayer _pcmPlayer = FlutterSoundPlayer(
+    logLevel: Level.warning,
+  );
+  final stt.SpeechToText _speechToText = stt.SpeechToText();
+  final FlutterTts _tts = FlutterTts();
+  final StringBuffer _liveReplyBuffer = StringBuffer();
+  final List<Uint8List> _playbackQueue = <Uint8List>[];
+
+  VoiceLiveSession? _liveSession;
+  StreamSubscription<VoiceLiveEvent>? _liveEventsSubscription;
+  StreamController<Uint8List>? _micPcmController;
+  StreamSubscription<Uint8List>? _micPcmSubscription;
+
+  bool _voiceReady = false;
+  bool _initializing = true;
+  bool _liveSessionConnecting = false;
+  bool _micStreamActive = false;
+  bool _playbackQueueActive = false;
+  bool _pcmRecorderReady = false;
+  bool _pcmPlayerReady = false;
+  bool _discardCurrentModelTurn = false;
+  bool _isDisposing = false;
+  bool _resumeMicAfterReconnect = false;
+  bool _shouldMaintainLiveConnection = false;
+  int _reconnectAttempt = 0;
+  Timer? _reconnectTimer;
+  final DateTime _sessionStartedAt = DateTime.now();
+  final List<String> _debugEvents = <String>[];
+  final List<_VoiceDebugCodeEvent> _codedDebugEvents =
+      <_VoiceDebugCodeEvent>[];
+  String? _lastLiveEventType;
+  DateTime? _lastLiveEventAt;
+  String? _lastReconnectReason;
+  DateTime? _lastReconnectAt;
+  bool _showDebugPanel = false;
+  bool _microphonePermissionGranted = false;
+  String _microphonePermissionState = 'unknown';
+  bool _micRecoveryInProgress = false;
+  bool _speechReady = false;
+  bool _fallbackListening = false;
+  bool _fallbackSpeaking = false;
+  bool _fallbackSubmitting = false;
+  String _fallbackTranscriptDraft = '';
+  final bool _allowDeviceSpeechFallback =
+      AiRuntimeConfig.enableDeviceSpeechFallback;
+  final int _liveInputSampleRate = AiRuntimeConfig.liveInputSampleRate;
+  int _liveOutputSampleRate = AiRuntimeConfig.liveOutputSampleRate;
+  DateTime? _suppressMicInputUntil;
+  Timer? _micHealthCheckTimer;
+  Timer? _fallbackAutoStopTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _appendDebugEvent('Voice assistant sheet initialized.');
+    unawaited(_initializeVoiceRuntime());
+  }
+
+  @override
+  void dispose() {
+    _isDisposing = true;
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(_shutdownVoiceRuntime());
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_isDisposing) {
+      return;
+    }
+
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      if (_micStreamActive) {
+        _appendDebugEvent('App paused. Temporarily stopping microphone stream.');
+        _resumeMicAfterReconnect = true;
+        unawaited(_stopMicStream(markProcessing: false, suppressUi: true));
+      }
+      if (_fallbackListening) {
+        unawaited(_stopFallbackListening(cancelOnly: true));
+      }
+      if (_fallbackSpeaking) {
+        unawaited(_stopFallbackSpeech());
+      }
+      return;
+    }
+
+    if (state == AppLifecycleState.resumed) {
+      if (_shouldMaintainLiveConnection &&
+          !_micStreamActive &&
+          (_resumeMicAfterReconnect || _liveSession != null)) {
+        _appendDebugEvent('App resumed. Restoring continuous voice mode.');
+        _resumeMicAfterReconnect = false;
+        unawaited(_startMicStream());
+      }
+    }
+  }
+
+  Future<void> _shutdownVoiceRuntime() async {
+    _cancelReconnectTimer();
+    _stopMicHealthMonitor();
+    _fallbackAutoStopTimer?.cancel();
+    _fallbackAutoStopTimer = null;
+    _shouldMaintainLiveConnection = false;
+    await _stopFallbackListening(cancelOnly: true);
+    await _stopFallbackSpeech();
+    await _stopMicStream(markProcessing: false, suppressUi: true);
+    await _clearPlayback(immediate: true);
+    await _disconnectLiveSession(updateState: false);
+    await _closeAudioRuntime();
+  }
+
+  Future<void> _initializeVoiceRuntime() async {
+    try {
+      if (AiRuntimeConfig.apiKey.trim().isEmpty) {
+        _appendDebugEvent(
+          'API key is missing from .env and dart-define. Check GEMINI_API_KEY.',
+          code: 'missing_api_key',
+        );
+      }
+
+      final bool hasMicrophonePermission = await _ensureMicrophonePermission();
+      if (!hasMicrophonePermission) {
+        if (mounted) {
+          setState(() {
+            _voiceReady = false;
+            _initializing = false;
+          });
+        }
+        return;
+      }
+
+      await _pcmRecorder.openRecorder();
+      _pcmRecorderReady = true;
+
+      await _pcmPlayer.openPlayer();
+      _pcmPlayerReady = true;
+      await _restartPcmPlayer(sampleRate: _liveOutputSampleRate);
+      if (_allowDeviceSpeechFallback) {
+        await _initializeFallbackVoiceRuntime();
+      } else {
+        _appendDebugEvent(
+          'Device speech fallback disabled. Using Gemini Live WebSocket path.',
+        );
+      }
+      _appendDebugEvent('Audio runtime initialized successfully.');
+
+      if (mounted) {
+        setState(() {
+          _voiceReady = true;
+          _initializing = false;
+        });
+      }
+    } catch (error) {
+      _appendDebugEvent(
+        'Audio runtime initialization failed: $error',
+        code: 'runtime_init',
+      );
+      if (mounted) {
+        ref
+            .read(voiceAssistantControllerProvider.notifier)
+            .setError(
+              'Voice runtime initialization failed. You can still use text input.',
+              code: 'runtime_init',
+            );
+        setState(() {
+          _voiceReady = false;
+          _initializing = false;
+        });
+      }
+    }
+  }
+
+  Future<bool> _ensureMicrophonePermission() async {
+    final PermissionStatus currentStatus = await Permission.microphone.status;
+    _microphonePermissionState = currentStatus.name;
+
+    if (currentStatus.isGranted) {
+      _microphonePermissionGranted = true;
+      _appendDebugEvent('Microphone permission granted.');
+      return true;
+    }
+
+    _appendDebugEvent('Requesting microphone permission.');
+    final PermissionStatus requestedStatus = await Permission.microphone.request();
+    _microphonePermissionState = requestedStatus.name;
+    _microphonePermissionGranted = requestedStatus.isGranted;
+
+    if (requestedStatus.isGranted) {
+      _appendDebugEvent('Microphone permission granted after request.');
+      return true;
+    }
+
+    final String message = requestedStatus.isPermanentlyDenied
+        ? 'Microphone permission is permanently denied. Enable it in Android app settings.'
+        : 'Microphone permission denied. Please allow microphone access and try again.';
+    _appendDebugEvent(message, code: 'mic_permission_denied');
+    if (mounted) {
+      ref
+          .read(voiceAssistantControllerProvider.notifier)
+          .setError(message, code: 'mic_permission_denied');
+    }
+    return false;
+  }
+
+  Future<void> _closeAudioRuntime() async {
+    if (_pcmRecorderReady) {
+      try {
+        if (!_pcmRecorder.isStopped) {
+          await _pcmRecorder.stopRecorder();
+        }
+      } catch (_) {}
+      try {
+        await _pcmRecorder.closeRecorder();
+      } catch (_) {}
+      _pcmRecorderReady = false;
+    }
+
+    if (_pcmPlayerReady) {
+      try {
+        if (!_pcmPlayer.isStopped) {
+          await _pcmPlayer.stopPlayer();
+        }
+      } catch (_) {}
+      try {
+        await _pcmPlayer.closePlayer();
+      } catch (_) {}
+      _pcmPlayerReady = false;
+    }
+  }
+
+  Future<void> _initializeFallbackVoiceRuntime() async {
+    try {
+      _speechReady = await _speechToText.initialize(
+        onStatus: _handleFallbackSpeechStatus,
+        onError: (dynamic error) {
+          final String errorText = error.toString();
+          _appendDebugEvent(
+            'Speech recognizer error: $errorText',
+            code: 'stt_error',
+          );
+          if (mounted && !_isDisposing) {
+            ref
+                .read(voiceAssistantControllerProvider.notifier)
+                .setError(
+                  'Speech recognition failed: $errorText',
+                  code: 'stt_error',
+                );
+          }
+        },
+      );
+
+      await _tts.awaitSpeakCompletion(true);
+      await _tts.setLanguage('en-IN');
+      await _tts.setSpeechRate(0.56);
+      await _tts.setPitch(1.0);
+      await _tts.setVolume(1.0);
+
+      _tts.setStartHandler(() {
+        _fallbackSpeaking = true;
+      });
+      _tts.setCompletionHandler(() {
+        _fallbackSpeaking = false;
+        if (!mounted || _isDisposing) {
+          return;
+        }
+        if (!_micStreamActive) {
+          ref
+              .read(voiceAssistantControllerProvider.notifier)
+              .setStatus(VoiceAssistantStatus.idle);
+        }
+      });
+      _tts.setCancelHandler(() {
+        _fallbackSpeaking = false;
+        if (!mounted || _isDisposing) {
+          return;
+        }
+        if (!_micStreamActive) {
+          ref
+              .read(voiceAssistantControllerProvider.notifier)
+              .setStatus(VoiceAssistantStatus.idle);
+        }
+      });
+      _tts.setErrorHandler((dynamic message) {
+        _appendDebugEvent('TTS error: $message', code: 'tts_error');
+      });
+    } catch (error) {
+      _speechReady = false;
+      _appendDebugEvent(
+        'Fallback voice runtime initialization failed: $error',
+        code: 'fallback_runtime',
+      );
+    }
+  }
+
+  void _handleFallbackSpeechStatus(String status) {
+    _appendDebugEvent('Speech status: $status');
+
+    if (status.toLowerCase() != 'notlistening') {
+      return;
+    }
+
+    if (!_fallbackListening || _fallbackSubmitting) {
+      return;
+    }
+
+    final String transcript = _fallbackTranscriptDraft.trim();
+    if (transcript.isEmpty) {
+      _fallbackListening = false;
+      if (mounted && !_isDisposing) {
+        ref
+            .read(voiceAssistantControllerProvider.notifier)
+            .setStatus(VoiceAssistantStatus.idle);
+      }
+      return;
+    }
+
+    unawaited(_completeFallbackTurn(transcript));
+  }
+
+  Future<void> _startFallbackSingleTurn() async {
+    if (_isDisposing || _fallbackSubmitting) {
+      return;
+    }
+
+    if (!_microphonePermissionGranted) {
+      final bool granted = await _ensureMicrophonePermission();
+      if (!granted) {
+        return;
+      }
+    }
+
+    if (!_speechReady) {
+      await _initializeFallbackVoiceRuntime();
+      if (!_speechReady) {
+        _appendDebugEvent(
+          'Voice fallback is not ready on this device.',
+          code: 'fallback_unavailable',
+          source: 'fallback_stt',
+        );
+        ref
+            .read(voiceAssistantControllerProvider.notifier)
+            .setError(
+              'Voice fallback is not ready on this device.',
+              code: 'fallback_unavailable',
+            );
+        return;
+      }
+    }
+
+    await _stopFallbackSpeech();
+    await _clearPlayback(immediate: true);
+
+    if (_speechToText.isListening) {
+      await _speechToText.stop();
+    }
+
+    _fallbackTranscriptDraft = '';
+    _fallbackListening = true;
+
+    final VoiceAssistantController controller = ref.read(
+      voiceAssistantControllerProvider.notifier,
+    );
+    controller.setStatus(VoiceAssistantStatus.listening);
+    controller.updateTranscript('Listening (fallback mode)...');
+
+    try {
+      await _speechToText.listen(
+        onResult: (dynamic result) {
+          final String transcript =
+              (result.recognizedWords?.toString() ?? '').trim();
+          if (transcript.isNotEmpty) {
+            _fallbackTranscriptDraft = transcript;
+            controller.updateTranscript(transcript);
+          }
+          if ((result.finalResult == true) && transcript.isNotEmpty) {
+            unawaited(_completeFallbackTurn(transcript));
+          }
+        },
+        listenFor: const Duration(seconds: 18),
+        pauseFor: const Duration(seconds: 2),
+        localeId: 'en_IN',
+        listenOptions: stt.SpeechListenOptions(
+          partialResults: true,
+          listenMode: stt.ListenMode.search,
+          cancelOnError: true,
+        ),
+      );
+
+      _fallbackAutoStopTimer?.cancel();
+      _fallbackAutoStopTimer = Timer(const Duration(seconds: 20), () {
+        if (!_fallbackListening || _fallbackSubmitting) {
+          return;
+        }
+        final String transcript = _fallbackTranscriptDraft.trim();
+        if (transcript.isNotEmpty) {
+          unawaited(_completeFallbackTurn(transcript));
+        } else {
+          unawaited(_stopFallbackListening(cancelOnly: true));
+        }
+      });
+    } catch (error) {
+      _fallbackListening = false;
+      _appendDebugEvent(
+        'Could not start fallback listening: $error',
+        code: 'fallback_listen',
+        source: 'fallback_stt',
+      );
+      controller.setError(
+        'Could not start fallback listening: $error',
+        code: 'fallback_listen',
+      );
+    }
+  }
+
+  Future<void> _completeFallbackTurn(String transcript) async {
+    if (_fallbackSubmitting) {
+      return;
+    }
+
+    final String cleaned = transcript.trim();
+    if (cleaned.isEmpty) {
+      await _stopFallbackListening(cancelOnly: true);
+      if (mounted && !_isDisposing) {
+        ref
+            .read(voiceAssistantControllerProvider.notifier)
+            .setStatus(VoiceAssistantStatus.idle);
+      }
+      return;
+    }
+
+    _fallbackSubmitting = true;
+    await _stopFallbackListening(cancelOnly: false);
+
+    final VoiceAssistantController controller = ref.read(
+      voiceAssistantControllerProvider.notifier,
+    );
+
+    controller.setStatus(VoiceAssistantStatus.processing);
+    controller.updateTranscript(cleaned);
+
+    try {
+      final VoiceAssistantReply? reply = await controller.submitTranscript(cleaned);
+      if (reply == null) {
+        return;
+      }
+
+      final String speech = reply.reply.trim();
+      if (speech.isEmpty) {
+        controller.setStatus(VoiceAssistantStatus.idle);
+        return;
+      }
+
+      controller.setStatus(VoiceAssistantStatus.speaking);
+      await _speakFallbackReply(speech);
+    } finally {
+      _fallbackSubmitting = false;
+    }
+  }
+
+  Future<void> _stopFallbackListening({required bool cancelOnly}) async {
+    _fallbackAutoStopTimer?.cancel();
+    _fallbackAutoStopTimer = null;
+
+    if (_speechToText.isListening) {
+      try {
+        if (cancelOnly) {
+          await _speechToText.cancel();
+        } else {
+          await _speechToText.stop();
+        }
+      } catch (_) {}
+    }
+
+    _fallbackListening = false;
+  }
+
+  Future<void> _stopFallbackSpeech() async {
+    try {
+      await _tts.stop();
+    } catch (_) {}
+    _fallbackSpeaking = false;
+  }
+
+  Future<void> _speakFallbackReply(String text) async {
+    final String cleaned = text.trim();
+    if (cleaned.isEmpty) {
+      return;
+    }
+
+    await _stopFallbackSpeech();
+    await _tts.speak(cleaned);
+  }
+
+  Future<void> _connectLiveSession() async {
+    if (!mounted || _isDisposing || _liveSessionConnecting || _liveSession != null) {
+      return;
+    }
+
+    _appendDebugEvent(
+      'Connecting live session (attempt ${_reconnectAttempt + 1}).',
+    );
+    _liveSessionConnecting = true;
+    final VoiceAssistantController controller = ref.read(
+      voiceAssistantControllerProvider.notifier,
+    );
+    final VoiceAssistantState currentState = ref.read(
+      voiceAssistantControllerProvider,
+    );
+    if (currentState.liveSessionReady) {
+      controller.setLiveSessionReady(false);
+    }
+
+    try {
+      final VoiceAssistantState state = ref.read(voiceAssistantControllerProvider);
+      final VoiceLiveSession session = await ref
+          .read(assistantServiceProvider)
+          .openVoiceLiveSession(
+            clientContext: ref.read(assistantClientContextProvider),
+            history: _historyPayloadForLive(messages: state.messages),
+          );
+
+      _liveSession = session;
+      _liveEventsSubscription = session.events.listen(
+        (VoiceLiveEvent event) {
+          unawaited(_handleLiveEvent(event));
+        },
+        onError: (Object error) {
+          _appendDebugEvent(
+            'Live event stream error: $error',
+            code: 'connection_error',
+          );
+          if (!mounted) {
+            return;
+          }
+          ref
+              .read(voiceAssistantControllerProvider.notifier)
+              .setError(
+                'Live voice connection failed. Retrying Gemini Live WebSocket.',
+                code: 'connection_error',
+              );
+          ref
+              .read(voiceAssistantControllerProvider.notifier)
+              .setLiveSessionReady(false);
+        },
+        cancelOnError: false,
+      );
+
+      controller.setLiveSessionReady(true);
+      _reconnectAttempt = 0;
+      _cancelReconnectTimer();
+      _appendDebugEvent('Live session connected and ready.');
+
+      if (_resumeMicAfterReconnect) {
+        _resumeMicAfterReconnect = false;
+        _appendDebugEvent('Resuming microphone after reconnect.');
+        unawaited(_startMicStream());
+      }
+    } catch (error) {
+      _resumeMicAfterReconnect =
+          _resumeMicAfterReconnect || _shouldMaintainLiveConnection;
+      _appendDebugEvent(
+        'Live session connect failed: $error',
+        code: 'connect_retry',
+      );
+      if (!mounted || _isDisposing) {
+        return;
+      }
+      controller.setLiveSessionReady(false);
+      controller.setError(
+        'Live session setup failed: $error',
+        code: 'connect_retry',
+      );
+      _scheduleReconnect(reason: error.toString());
+    } finally {
+      _liveSessionConnecting = false;
+    }
+  }
+
+  Future<void> _disconnectLiveSession({bool updateState = true}) async {
+    final StreamSubscription<VoiceLiveEvent>? subscription =
+        _liveEventsSubscription;
+    _liveEventsSubscription = null;
+    if (subscription != null) {
+      await subscription.cancel();
+    }
+
+    final VoiceLiveSession? session = _liveSession;
+    _liveSession = null;
+    if (session != null) {
+      await session.close();
+      _appendDebugEvent('Live session disconnected.');
+    }
+
+    if (mounted && updateState && !_isDisposing) {
+      ref
+          .read(voiceAssistantControllerProvider.notifier)
+          .setLiveSessionReady(false);
+    }
+  }
+
+  Future<void> _handleLiveEvent(VoiceLiveEvent event) async {
+    if (!mounted || _isDisposing) {
+      return;
+    }
+
+    _recordLiveEvent(event);
+
+    final VoiceAssistantController controller = ref.read(
+      voiceAssistantControllerProvider.notifier,
+    );
+
+    switch (event.type) {
+      case VoiceLiveEventType.setupComplete:
+        controller.setLiveSessionReady(true);
+        break;
+      case VoiceLiveEventType.textDelta:
+        if (_discardCurrentModelTurn || event.textDelta.isEmpty) {
+          return;
+        }
+
+        _liveReplyBuffer.write(event.textDelta);
+        final String partialReply = _liveReplyBuffer.toString();
+        controller.updateStreamingReply(partialReply);
+        if (ref.read(voiceAssistantControllerProvider).status !=
+            VoiceAssistantStatus.listening) {
+          controller.setStatus(VoiceAssistantStatus.speaking);
+        }
+        break;
+      case VoiceLiveEventType.audioChunk:
+        if (_discardCurrentModelTurn || event.audioChunk == null) {
+          return;
+        }
+
+        final int sampleRate = event.audioSampleRate ?? _liveOutputSampleRate;
+        if (sampleRate != _liveOutputSampleRate) {
+          await _restartPcmPlayer(sampleRate: sampleRate);
+        }
+
+        // Prevent speaker output from being re-ingested as user audio.
+        _extendMicUplinkPause(const Duration(milliseconds: 650));
+        _enqueuePlayback(event.audioChunk!);
+        controller.setStatus(VoiceAssistantStatus.speaking);
+        break;
+      case VoiceLiveEventType.turnComplete:
+        if (_discardCurrentModelTurn) {
+          _discardCurrentModelTurn = false;
+          _liveReplyBuffer.clear();
+          await _clearPlayback(immediate: true);
+          controller.clearStreamingReply();
+          return;
+        }
+
+        final String fullReply = event.fullText.trim().isNotEmpty
+            ? event.fullText.trim()
+            : _liveReplyBuffer.toString().trim();
+
+        if (fullReply.isNotEmpty) {
+          await controller.completeStreamingReply(fullReply);
+        } else {
+          controller.clearStreamingReply();
+        }
+
+        _liveReplyBuffer.clear();
+        if (_micStreamActive && _playbackQueue.isEmpty && !_playbackQueueActive) {
+          controller.setStatus(VoiceAssistantStatus.listening);
+          controller.updateTranscript('Continuous voice mode is active.');
+        } else if (_playbackQueue.isEmpty && !_playbackQueueActive && !_micStreamActive) {
+          controller.setStatus(VoiceAssistantStatus.idle);
+        }
+        break;
+      case VoiceLiveEventType.interrupted:
+        _appendDebugEvent('Model output interrupted. Keeping live listening active.');
+        _discardCurrentModelTurn = false;
+        _liveReplyBuffer.clear();
+        await _clearPlayback(immediate: true);
+        _extendMicUplinkPause(const Duration(milliseconds: 420));
+        controller.clearStreamingReply();
+        if (_micStreamActive) {
+          controller.setStatus(VoiceAssistantStatus.listening);
+          controller.updateTranscript('Continuous voice mode is active.');
+        } else if (_shouldMaintainLiveConnection) {
+          _resumeMicAfterReconnect = false;
+          unawaited(_startMicStream());
+        } else {
+          controller.setStatus(VoiceAssistantStatus.idle);
+        }
+        break;
+      case VoiceLiveEventType.disconnected:
+        _resumeMicAfterReconnect = _micStreamActive;
+        if (_micStreamActive) {
+          await _stopMicStream(markProcessing: false, suppressUi: true);
+        }
+        await _clearPlayback(immediate: true);
+        controller.setLiveSessionReady(false);
+        await _disconnectLiveSession(updateState: false);
+        _scheduleReconnect(reason: 'Live connection disconnected.');
+        break;
+      case VoiceLiveEventType.error:
+        if (_isTransientLiveError(event) && _shouldMaintainLiveConnection) {
+          _appendDebugEvent(
+            'Transient live error ignored: ${event.errorMessage ?? event.errorCode ?? 'unknown'}',
+            code: event.errorCode ?? event.errorStatus ?? 'transient_live_error',
+          );
+          controller.clearStreamingReply();
+          if (_micStreamActive) {
+            controller.setStatus(VoiceAssistantStatus.listening);
+            controller.updateTranscript('Continuous voice mode is active.');
+          } else {
+            _resumeMicAfterReconnect = false;
+            unawaited(_startMicStream());
+          }
+          break;
+        }
+
+        _resumeMicAfterReconnect = _micStreamActive;
+        if (_micStreamActive) {
+          await _stopMicStream(markProcessing: false, suppressUi: true);
+        }
+        await _clearPlayback(immediate: true);
+        controller.setLiveSessionReady(false);
+        controller.setError(
+          event.errorMessage ??
+              'Live voice session failed. Retrying Gemini Live WebSocket.',
+          code: event.errorCode ?? event.errorStatus,
+        );
+        await _disconnectLiveSession(updateState: false);
+        _scheduleReconnect(reason: event.errorMessage);
+        break;
+    }
+  }
+
+  void _cancelReconnectTimer() {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+  }
+
+  void _scheduleReconnect({String? reason}) {
+    if (!mounted || _isDisposing || !_shouldMaintainLiveConnection) {
+      return;
+    }
+
+    if (_liveSession != null || _liveSessionConnecting || _reconnectTimer != null) {
+      return;
+    }
+
+    const int maxAttempts = 12;
+    if (_reconnectAttempt >= maxAttempts) {
+      _shouldMaintainLiveConnection = false;
+      _resumeMicAfterReconnect = false;
+      _cancelReconnectTimer();
+      _appendDebugEvent(
+        'Reconnect exhausted after $maxAttempts attempts.',
+        code: 'reconnect_exhausted',
+      );
+      if (mounted) {
+        ref
+            .read(voiceAssistantControllerProvider.notifier)
+            .setError(
+              'Unable to maintain live connection. Tap Start continuous voice to retry.',
+              code: 'reconnect_exhausted',
+            );
+      }
+      return;
+    }
+
+    _reconnectAttempt += 1;
+    final int delaySeconds = switch (_reconnectAttempt) {
+      1 => 1,
+      2 => 2,
+      3 => 4,
+      4 => 8,
+      _ => 12,
+    };
+
+    _lastReconnectReason = (reason ?? '').trim().isEmpty
+        ? 'Unspecified reconnect reason.'
+        : reason!.trim();
+    _lastReconnectAt = DateTime.now();
+    _appendDebugEvent(
+      'Scheduled reconnect attempt $_reconnectAttempt in ${delaySeconds}s. Reason: $_lastReconnectReason',
+      code: 'reconnect_wait',
+    );
+
+    _reconnectTimer = Timer(Duration(seconds: delaySeconds), () {
+      _reconnectTimer = null;
+      if (!mounted || _isDisposing || !_shouldMaintainLiveConnection) {
+        return;
+      }
+      unawaited(_connectLiveSession());
+    });
+  }
+
+  Future<void> _restartPcmPlayer({required int sampleRate}) async {
+    if (!_pcmPlayerReady || _isDisposing) {
+      return;
+    }
+
+    if (!_pcmPlayer.isStopped && sampleRate == _liveOutputSampleRate) {
+      return;
+    }
+
+    if (!_pcmPlayer.isStopped) {
+      await _pcmPlayer.stopPlayer();
+    }
+
+    await _pcmPlayer.startPlayerFromStream(
+      codec: Codec.pcm16,
+      sampleRate: sampleRate,
+      numChannels: 1,
+      interleaved: true,
+      bufferSize: 2048,
+    );
+
+    _liveOutputSampleRate = sampleRate;
+  }
+
+  void _enqueuePlayback(Uint8List audioChunk) {
+    if (audioChunk.isEmpty) {
+      return;
+    }
+    _playbackQueue.add(audioChunk);
+    unawaited(_drainPlaybackQueue());
+  }
+
+  void _extendMicUplinkPause(Duration duration) {
+    final DateTime candidate = DateTime.now().add(duration);
+    final DateTime? activeUntil = _suppressMicInputUntil;
+    if (activeUntil == null || candidate.isAfter(activeUntil)) {
+      _suppressMicInputUntil = candidate;
+    }
+  }
+
+  bool _shouldSuppressMicUplink() {
+    if (_playbackQueueActive || _playbackQueue.isNotEmpty) {
+      return true;
+    }
+
+    final DateTime? activeUntil = _suppressMicInputUntil;
+    if (activeUntil == null) {
+      return false;
+    }
+
+    if (DateTime.now().isBefore(activeUntil)) {
+      return true;
+    }
+
+    _suppressMicInputUntil = null;
+    return false;
+  }
+
+  Future<void> _drainPlaybackQueue() async {
+    if (_playbackQueueActive) {
+      return;
+    }
+
+    _playbackQueueActive = true;
+    try {
+      while (mounted && _playbackQueue.isNotEmpty) {
+        if (_discardCurrentModelTurn) {
+          _playbackQueue.clear();
+          break;
+        }
+
+        if (!_pcmPlayerReady) {
+          break;
+        }
+
+        final Uint8List chunk = _playbackQueue.removeAt(0);
+        try {
+          if (_pcmPlayer.isStopped) {
+            await _restartPcmPlayer(sampleRate: _liveOutputSampleRate);
+          }
+          await _pcmPlayer.feedUint8FromStream(chunk);
+        } catch (_) {
+          await _restartPcmPlayer(sampleRate: _liveOutputSampleRate);
+          await _pcmPlayer.feedUint8FromStream(chunk);
+        }
+      }
+    } finally {
+      _playbackQueueActive = false;
+      if (mounted && _playbackQueue.isEmpty) {
+        _extendMicUplinkPause(const Duration(milliseconds: 320));
+        final VoiceAssistantController controller = ref.read(
+          voiceAssistantControllerProvider.notifier,
+        );
+        final VoiceAssistantStatus status = ref
+            .read(voiceAssistantControllerProvider)
+            .status;
+
+        if (_micStreamActive) {
+          if (status == VoiceAssistantStatus.speaking ||
+              status == VoiceAssistantStatus.processing) {
+            controller.setStatus(VoiceAssistantStatus.listening);
+            controller.updateTranscript('Continuous voice mode is active.');
+          }
+        } else if (status == VoiceAssistantStatus.speaking) {
+          controller.setStatus(VoiceAssistantStatus.idle);
+        }
+      }
+    }
+  }
+
+  Future<void> _clearPlayback({bool immediate = false}) async {
+    _playbackQueue.clear();
+    if (immediate && _pcmPlayerReady) {
+      try {
+        if (!_pcmPlayer.isStopped) {
+          await _pcmPlayer.stopPlayer();
+        }
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _startMicStream() async {
+    if (_isDisposing) {
+      return;
+    }
+
+    await _stopFallbackListening(cancelOnly: true);
+    await _stopFallbackSpeech();
+
+    if (AiRuntimeConfig.apiKey.trim().isEmpty) {
+      _appendDebugEvent(
+        'Cannot start voice because API key is missing.',
+        code: 'missing_api_key',
+      );
+      ref
+          .read(voiceAssistantControllerProvider.notifier)
+          .setError(
+            'Voice AI key is missing. Add GEMINI_API_KEY and retry.',
+            code: 'missing_api_key',
+          );
+      return;
+    }
+
+    if (!_microphonePermissionGranted) {
+      final bool hasMicrophonePermission = await _ensureMicrophonePermission();
+      if (!hasMicrophonePermission) {
+        return;
+      }
+    }
+
+    _shouldMaintainLiveConnection = true;
+    _resumeMicAfterReconnect = true;
+    _cancelReconnectTimer();
+
+    final VoiceAssistantController controller = ref.read(
+      voiceAssistantControllerProvider.notifier,
+    );
+    controller.setStatus(VoiceAssistantStatus.processing);
+    controller.updateTranscript('Connecting to voice...');
+
+    if (!_voiceReady || !_pcmRecorderReady) {
+      _appendDebugEvent(
+        'Cannot start microphone. Recorder is not ready on this device/session.',
+        code: 'runtime_unavailable',
+      );
+      ref
+          .read(voiceAssistantControllerProvider.notifier)
+          .setError(
+            'Microphone stream is unavailable on this device/session.',
+            code: 'runtime_unavailable',
+          );
+      return;
+    }
+
+    if (_liveSession == null) {
+      if (!_liveSessionConnecting && _reconnectTimer == null) {
+        await _connectLiveSession();
+      }
+    }
+
+    final VoiceLiveSession? session = _liveSession;
+    if (session == null) {
+      if (_liveSessionConnecting) {
+        _appendDebugEvent(
+          'Live session still connecting. Skipping reconnect scheduling.',
+        );
+        controller.setStatus(VoiceAssistantStatus.processing);
+        controller.updateTranscript('Connecting to Gemini Live WebSocket...');
+        return;
+      }
+      _resumeMicAfterReconnect = true;
+      _scheduleReconnect(reason: 'Live session not available for microphone start.');
+      _appendDebugEvent(
+        'Live session not ready during microphone start.',
+        code: 'not_ready',
+      );
+      controller.setStatus(VoiceAssistantStatus.processing);
+      controller.updateTranscript('Reconnecting voice...');
+      return;
+    }
+
+    if (_micStreamActive) {
+      return;
+    }
+
+    _discardCurrentModelTurn = false;
+    _liveReplyBuffer.clear();
+    _suppressMicInputUntil = null;
+    await _clearPlayback(immediate: false);
+
+    final StreamController<Uint8List> micController =
+        StreamController<Uint8List>();
+    _micPcmController = micController;
+    _micPcmSubscription = micController.stream.listen(
+      (Uint8List chunk) {
+        if (_shouldSuppressMicUplink()) {
+          return;
+        }
+
+        unawaited(
+          session
+              .sendRealtimeAudioChunk(
+                chunk,
+                sampleRate: _liveInputSampleRate,
+              )
+              .catchError((Object _) {}),
+        );
+      },
+      onError: (Object error) {
+        if (!mounted) {
+          return;
+        }
+        _appendDebugEvent(
+          'Microphone stream failed: $error',
+          code: 'mic_stream',
+          source: 'mic_stream',
+        );
+        ref
+            .read(voiceAssistantControllerProvider.notifier)
+            .setError('Microphone stream failed: $error', code: 'mic_stream');
+      },
+      cancelOnError: false,
+    );
+
+    try {
+      await _pcmRecorder.startRecorder(
+        toStream: micController.sink,
+        codec: Codec.pcm16,
+        numChannels: 1,
+        sampleRate: _liveInputSampleRate,
+        bufferSize: 2048,
+        enableNoiseSuppression: true,
+        enableEchoCancellation: true,
+        audioSource: AudioSource.defaultSource,
+      );
+
+      _micStreamActive = true;
+        _startMicHealthMonitor();
+      _appendDebugEvent('Microphone stream started.');
+
+      _resumeMicAfterReconnect = false;
+      controller.startLiveAudioTurn();
+      controller.updateTranscript('Continuous voice mode is active.');
+      controller.setStatus(VoiceAssistantStatus.listening);
+    } catch (error) {
+      _appendDebugEvent(
+        'Unable to start microphone stream: $error',
+        code: 'mic_start',
+      );
+      await _stopMicStream(markProcessing: false);
+      if (mounted) {
+        ref
+            .read(voiceAssistantControllerProvider.notifier)
+            .setError('Unable to start microphone stream: $error', code: 'mic_start');
+      }
+    }
+  }
+
+  Future<void> _stopMicStream({
+    required bool markProcessing,
+    bool suppressUi = false,
+  }) async {
+    _stopMicHealthMonitor();
+
+    if (!_micStreamActive && _micPcmSubscription == null && _micPcmController == null) {
+      return;
+    }
+
+    if (_pcmRecorderReady && !_pcmRecorder.isStopped) {
+      try {
+        await _pcmRecorder.stopRecorder();
+      } catch (_) {}
+    }
+
+    _micStreamActive = false;
+    _suppressMicInputUntil = null;
+    _appendDebugEvent('Microphone stream stopped.');
+
+    final StreamSubscription<Uint8List>? micSubscription = _micPcmSubscription;
+    _micPcmSubscription = null;
+    if (micSubscription != null) {
+      await micSubscription.cancel();
+    }
+
+    final StreamController<Uint8List>? micController = _micPcmController;
+    _micPcmController = null;
+    if (micController != null) {
+      await micController.close();
+    }
+
+    if (!mounted || _isDisposing || suppressUi) {
+      return;
+    }
+
+    final VoiceAssistantController controller = ref.read(
+      voiceAssistantControllerProvider.notifier,
+    );
+    if (markProcessing) {
+      controller.setStatus(VoiceAssistantStatus.processing);
+      controller.updateTranscript('');
+      return;
+    }
+
+    final VoiceAssistantStatus status = ref
+        .read(voiceAssistantControllerProvider)
+        .status;
+    if (status == VoiceAssistantStatus.listening ||
+        status == VoiceAssistantStatus.processing) {
+      controller.setStatus(VoiceAssistantStatus.idle);
+      controller.updateTranscript('');
+    }
+  }
+
+  bool _isTransientLiveError(VoiceLiveEvent event) {
+    final String code = (event.errorCode ?? '').trim().toLowerCase();
+    final String status = (event.errorStatus ?? '').trim().toLowerCase();
+    final String message = (event.errorMessage ?? '').trim().toLowerCase();
+
+    const Set<String> transientCodes = <String>{
+      '1',
+      '10',
+      '11',
+      'cancelled',
+      'canceled',
+      'aborted',
+      'unavailable',
+      'deadline_exceeded',
+    };
+
+    final bool interruptedMessage =
+        message.contains('interrupted') ||
+        message.contains('cancelled') ||
+        message.contains('canceled') ||
+        message.contains('audio stream') ||
+        message.contains('preempted');
+
+    return interruptedMessage ||
+        transientCodes.contains(code) ||
+        transientCodes.contains(status);
+  }
+
+  void _startMicHealthMonitor() {
+    _stopMicHealthMonitor();
+    _micHealthCheckTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      unawaited(_ensureMicStreamHealthy());
+    });
+  }
+
+  void _stopMicHealthMonitor() {
+    _micHealthCheckTimer?.cancel();
+    _micHealthCheckTimer = null;
+  }
+
+  Future<void> _ensureMicStreamHealthy() async {
+    if (!mounted ||
+        _isDisposing ||
+        !_shouldMaintainLiveConnection ||
+        !_voiceReady ||
+        !_pcmRecorderReady ||
+        !_micStreamActive ||
+        _micRecoveryInProgress) {
+      return;
+    }
+
+    if (!_pcmRecorder.isStopped) {
+      return;
+    }
+
+    _micRecoveryInProgress = true;
+    try {
+      _appendDebugEvent(
+        'Recorder became idle unexpectedly. Recovering continuous listening.',
+        code: 'mic_recover',
+      );
+      await _stopMicStream(markProcessing: false, suppressUi: true);
+      await _startMicStream();
+    } finally {
+      _micRecoveryInProgress = false;
+    }
+  }
+
+  Future<void> _toggleMicrophone(VoiceAssistantState state) async {
+    if (_initializing) {
+      return;
+    }
+
+    if (_micStreamActive) {
+      _appendDebugEvent('User stopped continuous voice mode.');
+      _shouldMaintainLiveConnection = false;
+      _resumeMicAfterReconnect = false;
+      _reconnectAttempt = 0;
+      _cancelReconnectTimer();
+      await _stopMicStream(markProcessing: false);
+      return;
+    }
+
+    if (_fallbackListening) {
+      await _stopFallbackListening(cancelOnly: true);
+      if (mounted && !_isDisposing) {
+        ref
+            .read(voiceAssistantControllerProvider.notifier)
+            .setStatus(VoiceAssistantStatus.idle);
+      }
+      return;
+    }
+
+    if (!state.liveSessionReady &&
+        !_liveSessionConnecting &&
+        _allowDeviceSpeechFallback) {
+      _appendDebugEvent('Live mode unavailable. Starting fallback voice turn.');
+      await _startFallbackSingleTurn();
+      return;
+    }
+
+    if (!state.liveSessionReady && !_liveSessionConnecting) {
+      _appendDebugEvent(
+        'Live mode not ready yet. Connecting Gemini Live WebSocket session.',
+      );
+    }
+
+    if (_liveSessionConnecting) {
+      ref
+          .read(voiceAssistantControllerProvider.notifier)
+          .setStatus(VoiceAssistantStatus.processing);
+      ref
+          .read(voiceAssistantControllerProvider.notifier)
+          .updateTranscript('Connecting to Gemini Live WebSocket...');
+      _appendDebugEvent('Live connection in progress. Waiting for setup complete.');
+      return;
+    }
+
+    _appendDebugEvent('User started continuous voice mode.');
+
+    if (state.status == VoiceAssistantStatus.speaking ||
+        state.status == VoiceAssistantStatus.processing) {
+      _discardCurrentModelTurn = true;
+      _liveReplyBuffer.clear();
+      await _clearPlayback(immediate: true);
+      ref
+          .read(voiceAssistantControllerProvider.notifier)
+          .clearStreamingReply();
+    }
+
+    await _startMicStream();
+  }
+
+  List<Map<String, String>> _historyPayloadForLive({
+    required List<AssistantMessage> messages,
+  }) {
+    final List<Map<String, String>> history = messages
+        .where((AssistantMessage message) => !message.isError)
+        .map((AssistantMessage message) => message.toHistoryPayload())
+        .toList(growable: false);
+
+    if (history.length <= 14) {
+      return history;
+    }
+
+    return history.sublist(history.length - 14);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final VoiceAssistantState state = ref.watch(voiceAssistantControllerProvider);
+    final bool isListening = state.status == VoiceAssistantStatus.listening;
+    final bool isSpeaking = state.status == VoiceAssistantStatus.speaking;
+
+    final Color currentColor = isSpeaking
+      ? Colors.purpleAccent
+        : (isListening ? Colors.greenAccent : Colors.grey);
+
+    return SafeArea(
+      child: Container(
+        height: MediaQuery.of(context).size.height * 0.75,
+        padding: EdgeInsets.fromLTRB(24, 24, 24, 24 + MediaQuery.of(context).viewInsets.bottom),
+        child: Column(
+          children: <Widget>[
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: <Widget>[
+                IconButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  icon: const Icon(Icons.close),
+                ),
+                GestureDetector(
+                  onLongPress: () {
+                    setState(() {
+                      _showDebugPanel = !_showDebugPanel;
+                    });
+                  },
+                  child: Text(
+                    state.liveSessionReady
+                        ? 'Live Mode'
+                        : (_allowDeviceSpeechFallback
+                              ? 'Fallback Mode'
+                              : 'Live Reconnecting'),
+                    style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      color: state.liveSessionReady ? Colors.green : Colors.orange,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  onPressed: () {
+                    final GoRouter router = GoRouter.of(context);
+                    Navigator.of(context).pop();
+                    router.push(AppRoutes.chatAssistant);
+                  },
+                  icon: const Icon(Icons.chat_bubble_outline),
+                ),
+              ],
+            ),
+            const Spacer(),
+            // Avatar/Orb visualization
+            GestureDetector(
+              onTap: _initializing ? null : () => _toggleMicrophone(state),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 300),
+                width: isListening || isSpeaking ? 160 : 120,
+                height: isListening || isSpeaking ? 160 : 120,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: currentColor.withValues(
+                    alpha: isListening || isSpeaking ? 0.3 : 0.1,
+                  ),
+                  border: Border.all(
+                    color: currentColor.withValues(alpha: 0.8),
+                    width: isListening || isSpeaking ? 4 : 2,
+                  ),
+                  boxShadow: <BoxShadow>[
+                    if (isListening || isSpeaking)
+                      BoxShadow(
+                        color: currentColor.withValues(alpha: 0.5),
+                        blurRadius: 40,
+                        spreadRadius: 10,
+                      ),
+                  ],
+                ),
+                child: Center(
+                  child: Icon(
+                    _micIcon(state.status),
+                    size: 60,
+                    color: currentColor,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 48),
+            // Minimal text indicator
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 300),
+              child: Text(
+                _statusLabel(state.status),
+                key: ValueKey(state.status),
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                  color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.7),
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
+            const SizedBox(height: 24),
+            if (state.transcript.isNotEmpty || state.streamingReply.isNotEmpty)
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Theme.of(
+                    context,
+                  ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.4),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    if (state.transcript.isNotEmpty)
+                      Text(
+                        '"${state.transcript}"',
+                        style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                          fontStyle: FontStyle.italic,
+                          color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.8),
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    if (state.transcript.isNotEmpty && state.streamingReply.isNotEmpty)
+                      const Divider(height: 24),
+                    if (state.streamingReply.isNotEmpty)
+                      Text(
+                        state.streamingReply,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: Theme.of(context).colorScheme.primary,
+                          fontWeight: FontWeight.w500,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                  ],
+                ),
+              ),
+            if (_showDebugPanel) ...<Widget>[
+              const SizedBox(height: 20),
+              _buildVoiceStatusConsole(context, state),
+              const SizedBox(height: 10),
+              _buildDebugPanel(context, state),
+            ],
+            const Spacer(),
+            Semantics(
+              label: _micLabel(state.status),
+              child: const SizedBox.shrink(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _statusLabel(VoiceAssistantStatus status) {
+    switch (status) {
+      case VoiceAssistantStatus.idle:
+        return 'Tap to Start Listening';
+      case VoiceAssistantStatus.listening:
+        return 'Listening...';
+      case VoiceAssistantStatus.processing:
+        return 'Thinking...';
+      case VoiceAssistantStatus.speaking:
+        return 'Speaking...';
+      case VoiceAssistantStatus.error:
+        return 'An error occurred';
+    }
+  }
+
+  Widget _buildVoiceStatusConsole(
+    BuildContext context,
+    VoiceAssistantState state,
+  ) {
+    final ColorScheme colorScheme = Theme.of(context).colorScheme;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.34),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: colorScheme.outlineVariant.withValues(alpha: 0.46)),
+      ),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: <Widget>[
+          _buildStatusChip(
+            context: context,
+            icon: state.liveSessionReady
+                ? Icons.wifi_tethering
+                : Icons.wifi_tethering_error,
+            label: state.liveSessionReady ? 'Live connected' : 'Fallback mode',
+            background: state.liveSessionReady
+                ? colorScheme.primary.withValues(alpha: 0.14)
+                : colorScheme.surface,
+          ),
+          _buildStatusChip(
+            context: context,
+            icon: _statusIcon(state.status),
+            label: _statusLabel(state.status),
+            background: _statusColor(context, state.status).withValues(alpha: 0.16),
+          ),
+          _buildStatusChip(
+            context: context,
+            icon: Icons.settings_voice,
+            label: 'Voice: ${AiRuntimeConfig.liveVoiceName}',
+            background: colorScheme.secondary.withValues(alpha: 0.14),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusChip({
+    required BuildContext context,
+    required IconData icon,
+    required String label,
+    required Color background,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Icon(icon, size: 15),
+          const SizedBox(width: 6),
+          Text(label, style: Theme.of(context).textTheme.labelMedium),
+        ],
+      ),
+    );
+  }
+
+  void _recordLiveEvent(VoiceLiveEvent event) {
+    _lastLiveEventType = event.type.name;
+    _lastLiveEventAt = DateTime.now();
+
+    switch (event.type) {
+      case VoiceLiveEventType.setupComplete:
+        _appendDebugEvent('Live setup complete.');
+        break;
+      case VoiceLiveEventType.turnComplete:
+        _appendDebugEvent('Live turn complete.');
+        break;
+      case VoiceLiveEventType.interrupted:
+        _appendDebugEvent('Live response interrupted.');
+        break;
+      case VoiceLiveEventType.disconnected:
+        _appendDebugEvent('Live socket disconnected.', code: 'disconnected');
+        break;
+      case VoiceLiveEventType.error:
+        _appendDebugEvent(
+          event.errorMessage ?? 'Live event error.',
+          code: event.errorCode ?? event.errorStatus ?? 'live_error',
+          source: 'live_event',
+          status: event.errorStatus,
+        );
+        break;
+      case VoiceLiveEventType.textDelta:
+      case VoiceLiveEventType.audioChunk:
+        break;
+    }
+  }
+
+  void _appendDebugEvent(
+    String message, {
+    String? code,
+    String source = 'voice_bot',
+    String? status,
+  }) {
+    final String timestamp = DateFormat('HH:mm:ss').format(DateTime.now());
+    final DateTime timestampUtc = DateTime.now().toUtc();
+    final String normalizedCode = (code ?? '').trim();
+    final String normalizedStatus = (status ?? '').trim();
+    final String line = normalizedCode.isEmpty
+        ? '[$timestamp] $message'
+        : '[$timestamp][$normalizedCode] $message';
+    _debugEvents.insert(0, line);
+    if (_debugEvents.length > 80) {
+      _debugEvents.removeRange(80, _debugEvents.length);
+    }
+
+    if (normalizedCode.isNotEmpty) {
+      _codedDebugEvents.insert(
+        0,
+        _VoiceDebugCodeEvent(
+          timestampUtc: timestampUtc,
+          source: source,
+          code: normalizedCode,
+          status: normalizedStatus.isEmpty ? null : normalizedStatus,
+          message: message,
+        ),
+      );
+      if (_codedDebugEvents.length > 120) {
+        _codedDebugEvents.removeRange(120, _codedDebugEvents.length);
+      }
+    }
+
+    if (mounted && !_isDisposing) {
+      setState(() {});
+    }
+  }
+
+  String _buildDebugSnapshot(VoiceAssistantState state) {
+    final DateTime now = DateTime.now();
+    final String uptime = _formatDuration(now.difference(_sessionStartedAt));
+    final String lastEvent = _lastLiveEventType == null
+        ? 'none'
+        : '$_lastLiveEventType @ ${_formatTimestamp(_lastLiveEventAt)}';
+    final String reconnectInfo = _lastReconnectAt == null
+        ? 'none'
+        : '${_formatTimestamp(_lastReconnectAt)} | ${_lastReconnectReason ?? 'unknown'}';
+    final List<_VoiceDebugCodeEvent> recentErrorCodes = _codedDebugEvents
+        .where((_) => true)
+        .take(20)
+        .toList(growable: false);
+
+    final List<String> lines = <String>[
+      'report.version: voice-debug-v2',
+      'report.generatedAtUtc: ${DateTime.now().toUtc().toIso8601String()}',
+      'platform: ${defaultTargetPlatform.name}',
+      'uptime: $uptime',
+      'state.status: ${state.status.name}',
+      'state.liveSessionReady: ${state.liveSessionReady}',
+      'state.activeModel: ${state.activeModel ?? '-'}',
+      'state.errorCode: ${state.errorCode ?? '-'}',
+      'state.errorMessage: ${state.errorMessage ?? '-'}',
+      'runtime.voiceReady: $_voiceReady',
+      'runtime.recorderReady: $_pcmRecorderReady',
+      'runtime.playerReady: $_pcmPlayerReady',
+      'runtime.micStreamActive: $_micStreamActive',
+      'runtime.liveSessionConnecting: $_liveSessionConnecting',
+      'runtime.liveSessionObject: ${_liveSession != null}',
+      'runtime.maintainConnection: $_shouldMaintainLiveConnection',
+      'runtime.resumeMicAfterReconnect: $_resumeMicAfterReconnect',
+      'runtime.reconnectAttempt: $_reconnectAttempt',
+      'runtime.reconnectTimerActive: ${_reconnectTimer != null}',
+      'runtime.lastReconnect: $reconnectInfo',
+      'runtime.lastLiveEvent: $lastEvent',
+      'runtime.deviceSpeechFallbackEnabled: $_allowDeviceSpeechFallback',
+      'runtime.micPermissionGranted: $_microphonePermissionGranted',
+      'runtime.micPermissionState: $_microphonePermissionState',
+      'config.apiKeyLoaded: ${AiRuntimeConfig.apiKey.trim().isNotEmpty}',
+      'config.voiceModel: ${AiRuntimeConfig.voiceModel}',
+      'config.voiceName: ${AiRuntimeConfig.liveVoiceName}',
+      'config.inputSampleRate: $_liveInputSampleRate',
+      'config.outputSampleRate: $_liveOutputSampleRate',
+      'codedEventCount: ${_codedDebugEvents.length}',
+      'recentErrorCodes:',
+      if (recentErrorCodes.isEmpty) '  (none)',
+      ...recentErrorCodes.map(
+        (_VoiceDebugCodeEvent entry) =>
+            '  [${entry.timestampUtc.toIso8601String()}] source=${entry.source}; code=${entry.code}; status=${entry.status ?? '-'}; message=${entry.message}',
+      ),
+      'recentEvents:',
+      ..._debugEvents.take(20).map((String line) => '  $line'),
+    ];
+
+    return lines.join('\n');
+  }
+
+  String _formatTimestamp(DateTime? value) {
+    if (value == null) {
+      return '-';
+    }
+    return DateFormat('HH:mm:ss').format(value);
+  }
+
+  String _formatDuration(Duration duration) {
+    final int totalSeconds = duration.inSeconds;
+    final int hours = totalSeconds ~/ 3600;
+    final int minutes = (totalSeconds % 3600) ~/ 60;
+    final int seconds = totalSeconds % 60;
+    return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  Future<void> _copyDebugSnapshot(VoiceAssistantState state) async {
+    final String snapshot = _buildDebugSnapshot(state);
+    await Clipboard.setData(ClipboardData(text: snapshot));
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Debug report copied to clipboard.')),
+    );
+  }
+
+  Widget _buildDebugPanel(BuildContext context, VoiceAssistantState state) {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(
+          alpha: 0.24,
+        ),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: ExpansionTile(
+        initiallyExpanded: _showDebugPanel,
+        onExpansionChanged: (bool expanded) {
+          setState(() {
+            _showDebugPanel = expanded;
+          });
+        },
+        title: Text(
+          'Debug details (device test)',
+          style: Theme.of(context).textTheme.bodyMedium,
+        ),
+        subtitle: Text(
+          'Live: ${state.liveSessionReady} | err: ${state.errorCode ?? '-'} | reconnect: $_reconnectAttempt | mic: $_micStreamActive',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: () => _copyDebugSnapshot(state),
+                  icon: const Icon(Icons.copy, size: 16),
+                  label: const Text('Copy detailed report'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: _liveSessionConnecting
+                      ? null
+                      : () async {
+                          _appendDebugEvent('Manual reconnect requested.');
+                          await _disconnectLiveSession(updateState: false);
+                          if (!mounted || _isDisposing) {
+                            return;
+                          }
+                          await _connectLiveSession();
+                        },
+                  icon: const Icon(Icons.refresh, size: 16),
+                  label: const Text('Reconnect'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.6),
+            ),
+            child: SelectableText(
+              _buildDebugSnapshot(state),
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                fontFamily: 'monospace',
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  IconData _statusIcon(VoiceAssistantStatus status) {
+    switch (status) {
+      case VoiceAssistantStatus.idle:
+        return Icons.pause_circle_outline;
+      case VoiceAssistantStatus.listening:
+        return Icons.mic;
+      case VoiceAssistantStatus.processing:
+        return Icons.hourglass_top;
+      case VoiceAssistantStatus.speaking:
+        return Icons.volume_up;
+      case VoiceAssistantStatus.error:
+        return Icons.error_outline;
+    }
+  }
+
+  IconData _micIcon(VoiceAssistantStatus status) {
+    switch (status) {
+      case VoiceAssistantStatus.listening:
+        return Icons.stop_circle_outlined;
+      case VoiceAssistantStatus.speaking:
+        return Icons.mic;
+      case VoiceAssistantStatus.processing:
+        return Icons.hearing;
+      case VoiceAssistantStatus.error:
+      case VoiceAssistantStatus.idle:
+        return Icons.mic_none;
+    }
+  }
+
+  String _micLabel(VoiceAssistantStatus status) {
+    switch (status) {
+      case VoiceAssistantStatus.listening:
+        return 'Stop continuous voice';
+      case VoiceAssistantStatus.speaking:
+        return 'Stop continuous voice';
+      case VoiceAssistantStatus.processing:
+        return 'Stop continuous voice';
+      case VoiceAssistantStatus.error:
+      case VoiceAssistantStatus.idle:
+        return 'Start continuous voice';
+    }
+  }
+
+  Color _statusColor(BuildContext context, VoiceAssistantStatus status) {
+    switch (status) {
+      case VoiceAssistantStatus.listening:
+        return Theme.of(context).colorScheme.primary;
+      case VoiceAssistantStatus.processing:
+        return Colors.amber;
+      case VoiceAssistantStatus.speaking:
+        return Theme.of(context).colorScheme.secondary;
+      case VoiceAssistantStatus.error:
+        return Theme.of(context).colorScheme.error;
+      case VoiceAssistantStatus.idle:
+        return Theme.of(context).colorScheme.outline;
+    }
+  }
+}
+
+class _VoiceDebugCodeEvent {
+  const _VoiceDebugCodeEvent({
+    required this.timestampUtc,
+    required this.source,
+    required this.code,
+    required this.message,
+    this.status,
+  });
+
+  final DateTime timestampUtc;
+  final String source;
+  final String code;
+  final String message;
+  final String? status;
+}

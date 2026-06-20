@@ -1,0 +1,1721 @@
+﻿import 'dart:math' as math;
+
+import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart';
+import 'package:student_fin_os/core/utils/currency_formatter.dart';
+import 'package:student_fin_os/core/widgets/empty_state.dart';
+import 'package:student_fin_os/core/widgets/section_header.dart';
+import 'package:student_fin_os/models/ai_insight.dart';
+import 'package:student_fin_os/models/dashboard_snapshot.dart';
+import 'package:student_fin_os/models/finance_enums.dart';
+import 'package:student_fin_os/models/finance_transaction.dart';
+import 'package:student_fin_os/providers/cash_flow_providers.dart';
+import 'package:student_fin_os/providers/dashboard_providers.dart';
+import 'package:student_fin_os/providers/insights_providers.dart';
+
+enum _InsightFilter {
+  all,
+  critical,
+  warning,
+  info,
+}
+
+enum _MetricSignal {
+  positive,
+  negative,
+  neutral,
+}
+
+class InsightsScreen extends ConsumerStatefulWidget {
+  const InsightsScreen({super.key});
+
+  @override
+  ConsumerState<InsightsScreen> createState() => _InsightsScreenState();
+}
+
+class _InsightsScreenState extends ConsumerState<InsightsScreen>
+  with TickerProviderStateMixin {
+  _InsightFilter _filter = _InsightFilter.all;
+  double _assumedAnnualReturn = 12;
+  int _sipYears = 10;
+  int _selectedSipAmount = 2000;
+  late final AnimationController _urgentPulseController;
+  late final AnimationController _syncSpinController;
+  bool _isUrgentPulseRunning = false;
+  bool _isSyncingFeed = false;
+
+  static const List<int> _sipScenarioAmounts = <int>[
+    500,
+    1000,
+    2000,
+    5000,
+    10000,
+    15000,
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _urgentPulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    );
+    _syncSpinController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      ref.read(insightsControllerProvider.notifier).refreshRuleBasedInsights();
+    });
+  }
+
+  @override
+  void dispose() {
+    _urgentPulseController.dispose();
+    _syncSpinController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 4,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Financial Insights'),
+          bottom: const TabBar(
+            isScrollable: true,
+            tabs: [
+              Tab(text: 'Feed'),
+              Tab(text: 'Budget'),
+              Tab(text: 'Savings'),
+              Tab(text: 'Invest'),
+            ],
+          ),
+        ),
+        body: TabBarView(
+          children: [
+            _buildFeedTab(context),
+            _buildBudgetTab(context),
+            _buildSavingsTab(context),
+            _buildInvestingTab(context),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFeedTab(BuildContext context) {
+    final List<AiInsight> insights = ref.watch(insightsFeedProvider).value ?? const <AiInsight>[];
+    final List<AiInsight> automated = ref.watch(automatedInsightsProvider);
+    final DateTime? lowBalanceDate = ref.watch(predictedLowBalanceDateProvider);
+    final List<AiInsight> stableInsights = _dedupeInsights(insights);
+
+    final List<AiInsight> filtered = stableInsights.where((AiInsight insight) {
+      switch (_filter) {
+        case _InsightFilter.all:
+          return true;
+        case _InsightFilter.critical:
+          return insight.severity == InsightSeverity.critical;
+        case _InsightFilter.warning:
+          return insight.severity == InsightSeverity.warning;
+        case _InsightFilter.info:
+          return insight.severity == InsightSeverity.info;
+      }
+    }).toList();
+
+    final List<AiInsight> prioritized = List<AiInsight>.from(filtered)
+      ..sort((AiInsight a, AiInsight b) {
+        final int bySeverity =
+            _severityRank(a.severity).compareTo(_severityRank(b.severity));
+        if (bySeverity != 0) {
+          return bySeverity;
+        }
+        return b.createdAt.compareTo(a.createdAt);
+      });
+
+    final int criticalCount = stableInsights
+        .where((AiInsight insight) => insight.severity == InsightSeverity.critical)
+        .length;
+    final int warningCount = stableInsights
+        .where((AiInsight insight) => insight.severity == InsightSeverity.warning)
+        .length;
+    final int infoCount = stableInsights
+        .where((AiInsight insight) => insight.severity == InsightSeverity.info)
+        .length;
+
+    final bool hasCritical = criticalCount > 0;
+    final bool hasWarning = !hasCritical && warningCount > 0;
+    _updateUrgentPulse(hasCritical);
+    final Color summaryColor = hasCritical
+        ? const Color(0xFFC62828)
+        : (hasWarning ? const Color(0xFFEF6C00) : const Color(0xFF2E7D32));
+    final IconData summaryIcon = hasCritical
+        ? Icons.notification_important_rounded
+        : (hasWarning ? Icons.warning_amber_rounded : Icons.verified_rounded);
+    final String summaryTitle = hasCritical
+        ? 'Urgent attention needed'
+        : (hasWarning ? 'Review warnings soon' : 'All clear right now');
+    final String summaryMessage = hasCritical
+        ? '$criticalCount urgent alert${criticalCount == 1 ? '' : 's'} need action today.'
+        : (hasWarning
+            ? '$warningCount heads-up item${warningCount == 1 ? '' : 's'} to review this week.'
+            : 'No urgent alerts detected. Keep tracking your feed.');
+
+    final Widget insightListContent = prioritized.isEmpty
+        ? const EmptyState(
+            title: 'No insights in this filter',
+            message: 'Insights will appear automatically from your latest data.',
+            icon: Icons.lightbulb,
+          )
+        : Column(
+            key: ValueKey<String>('${_filter.name}-${prioritized.length}'),
+            children: prioritized.asMap().entries.map((MapEntry<int, AiInsight> entry) {
+              final int index = entry.key;
+              final AiInsight insight = entry.value;
+              final Color severityColor = _colorForSeverity(insight.severity);
+              final Widget card = Card(
+                margin: const EdgeInsets.only(bottom: 8),
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: severityColor.withValues(alpha: 0.22)),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Row(
+                          children: <Widget>[
+                            _severityPill(context, insight.severity),
+                            const Spacer(),
+                            Text(
+                              _relativeTime(insight.createdAt),
+                              style: Theme.of(context).textTheme.labelSmall,
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            Icon(
+                              _iconForSeverity(insight.severity),
+                              color: severityColor,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                insight.title,
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleSmall
+                                    ?.copyWith(fontWeight: FontWeight.w700),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          insight.message,
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 10),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: <Widget>[
+                            _compactTag(
+                              context,
+                              _actionHint(insight.severity),
+                              color: severityColor,
+                            ),
+                            _compactTag(
+                              context,
+                              'Priority ${_severityLabel(insight.severity)}',
+                              color: severityColor,
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+              return _staggerReveal(
+                index: index,
+                child: card,
+              );
+            }).toList(growable: false),
+          );
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: _statusCard(
+                context,
+                label: 'Urgent',
+                value: '$criticalCount',
+                color: Colors.redAccent,
+                icon: Icons.priority_high_rounded,
+                subtitle: 'Today',
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _statusCard(
+                context,
+                label: 'Heads-up',
+                value: '$warningCount',
+                color: Colors.orangeAccent,
+                icon: Icons.schedule_rounded,
+                subtitle: 'This week',
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _statusCard(
+                context,
+                label: 'FYI',
+                value: '$infoCount',
+                color: Colors.blueAccent,
+                icon: Icons.info_outline_rounded,
+                subtitle: 'Track',
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        _buildAlertSummaryCard(
+          context,
+          hasCritical: hasCritical,
+          summaryColor: summaryColor,
+          summaryIcon: summaryIcon,
+          summaryTitle: summaryTitle,
+          summaryMessage: summaryMessage,
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: <Widget>[
+            const Expanded(
+              child: SectionHeader(
+                title: 'Money Feed',
+                subtitle: 'Clear alerts + what to do next',
+              ),
+            ),
+            FilledButton.icon(
+              onPressed: _isSyncingFeed ? null : _syncFeed,
+              icon: AnimatedBuilder(
+                animation: _syncSpinController,
+                builder: (BuildContext context, Widget? child) {
+                  return Transform.rotate(
+                    angle: _syncSpinController.value * math.pi * 2,
+                    child: child,
+                  );
+                },
+                child: Icon(
+                  _isSyncingFeed ? Icons.sync_rounded : Icons.auto_awesome,
+                ),
+              ),
+              label: Text(_isSyncingFeed ? 'Syncing...' : 'Sync Feed'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.timeline),
+            title: const Text('Balance runway'),
+            subtitle: Text(
+              lowBalanceDate == null
+                  ? 'You look stable for the next 14 days.'
+                  : 'At current pace, balance may get tight around ${DateFormat('dd MMM').format(lowBalanceDate)}.',
+            ),
+          ),
+        ),
+        if (automated.isNotEmpty) ...<Widget>[
+          const SizedBox(height: 10),
+          const SectionHeader(
+            title: 'Auto Recommendations',
+            subtitle: 'Generated from your latest dashboard and transaction data',
+          ),
+          const SizedBox(height: 8),
+          ...automated.take(3).map((AiInsight insight) {
+            return Card(
+              margin: const EdgeInsets.only(bottom: 8),
+              child: ListTile(
+                leading: Icon(
+                  _iconForSeverity(insight.severity),
+                  color: _colorForSeverity(insight.severity),
+                ),
+                title: Text(insight.title),
+                  subtitle: Text(
+                    insight.message,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+              ),
+            );
+          }),
+        ],
+        const SizedBox(height: 10),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: <Widget>[
+              _filterChip(
+                'All',
+                _InsightFilter.all,
+                count: stableInsights.length,
+                icon: Icons.grid_view_rounded,
+              ),
+              const SizedBox(width: 8),
+              _filterChip(
+                'Urgent',
+                _InsightFilter.critical,
+                count: criticalCount,
+                icon: Icons.priority_high_rounded,
+              ),
+              const SizedBox(width: 8),
+              _filterChip(
+                'Heads-up',
+                _InsightFilter.warning,
+                count: warningCount,
+                icon: Icons.schedule_rounded,
+              ),
+              const SizedBox(width: 8),
+              _filterChip(
+                'FYI',
+                _InsightFilter.info,
+                count: infoCount,
+                icon: Icons.info_outline_rounded,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        AnimatedSwitcher(
+          duration: _animationsDisabled
+              ? Duration.zero
+              : const Duration(milliseconds: 240),
+          switchInCurve: Curves.easeOut,
+          switchOutCurve: Curves.easeIn,
+          transitionBuilder: (Widget child, Animation<double> animation) {
+            return FadeTransition(
+              opacity: animation,
+              child: child,
+            );
+          },
+          child: KeyedSubtree(
+            key: ValueKey<String>('feed-${_filter.name}-${prioritized.length}'),
+            child: insightListContent,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAlertSummaryCard(
+    BuildContext context, {
+    required bool hasCritical,
+    required Color summaryColor,
+    required IconData summaryIcon,
+    required String summaryTitle,
+    required String summaryMessage,
+  }) {
+    final Widget card = Card(
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: summaryColor.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: summaryColor.withValues(alpha: 0.32)),
+        ),
+        child: Row(
+          children: <Widget>[
+            Icon(summaryIcon, color: summaryColor),
+            const SizedBox(width: 10),
+            Expanded(
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 280),
+                switchInCurve: Curves.easeOut,
+                switchOutCurve: Curves.easeIn,
+                transitionBuilder: (Widget child, Animation<double> animation) {
+                  return FadeTransition(
+                    opacity: animation,
+                    child: child,
+                  );
+                },
+                child: Column(
+                  key: ValueKey<String>(summaryTitle),
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      summaryTitle,
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                            fontWeight: FontWeight.w700,
+                            color: summaryColor,
+                          ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      summaryMessage,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (!hasCritical) {
+      return card;
+    }
+
+    return AnimatedBuilder(
+      animation: _urgentPulseController,
+      builder: (BuildContext context, Widget? child) {
+        final double t = _urgentPulseController.value;
+        final double scale = 1 + (t * 0.02);
+        return Transform.scale(
+          scale: scale,
+          child: child,
+        );
+      },
+      child: card,
+    );
+  }
+
+  List<AiInsight> _dedupeInsights(List<AiInsight> items) {
+    final Map<String, AiInsight> byKey = <String, AiInsight>{};
+    for (final AiInsight insight in items) {
+      final String key = '${insight.severity.name}::${insight.title.toLowerCase()}';
+      final AiInsight? existing = byKey[key];
+      if (existing == null || insight.createdAt.isAfter(existing.createdAt)) {
+        byKey[key] = insight;
+      }
+    }
+    final List<AiInsight> deduped = byKey.values.toList(growable: false)
+      ..sort((AiInsight a, AiInsight b) => b.createdAt.compareTo(a.createdAt));
+    return deduped;
+  }
+
+  Widget _buildBudgetTab(BuildContext context) {
+    final DashboardSnapshot snapshot = ref.watch(dashboardSnapshotProvider);
+    final List<FinanceTransaction> transactions =
+        ref.watch(transactionsProvider).value ?? const <FinanceTransaction>[];
+    final DateTime now = DateTime.now();
+    final List<FinanceTransaction> monthTransactions = _monthTransactions(
+      transactions,
+      now,
+    );
+
+    final double monthIncome = _monthIncome(monthTransactions);
+    final double monthExpense = _monthExpense(monthTransactions);
+    final int daysInMonth = _daysInMonth(now);
+    final int elapsedDays = now.day.clamp(1, daysInMonth);
+    final double avgDailySpend =
+        elapsedDays == 0 ? 0 : monthExpense / elapsedDays;
+    final double forecastSpend = avgDailySpend * daysInMonth;
+    final double monthlyTrend = snapshot.monthlyTrendPercent;
+
+    final _MetricSignal spendSignal = monthlyTrend > 0
+      ? _MetricSignal.negative
+      : (monthlyTrend < 0 ? _MetricSignal.positive : _MetricSignal.neutral);
+    final String spendSignalLabel =
+      '${monthlyTrend >= 0 ? '+' : ''}${monthlyTrend.toStringAsFixed(1)}%';
+
+    final _MetricSignal incomeSignal = monthIncome >= monthExpense
+      ? _MetricSignal.positive
+      : _MetricSignal.negative;
+    final _MetricSignal estimateSignal = forecastSpend <= monthIncome
+      ? _MetricSignal.positive
+      : _MetricSignal.negative;
+    final _MetricSignal safeSignal = snapshot.safeToSpend > 0
+      ? _MetricSignal.positive
+      : _MetricSignal.negative;
+
+    final List<MapEntry<String, double>> topCategories = _topExpenseCategories(
+      monthTransactions,
+      5,
+    );
+    final List<Widget> metricCards = <Widget>[
+      _metricCard(
+        context,
+        label: 'This Month Spend',
+        value: CurrencyFormatter.inr(monthExpense),
+        icon: Icons.payments_outlined,
+        signal: spendSignal,
+        signalLabel: spendSignalLabel,
+      ),
+      _metricCard(
+        context,
+        label: 'This Month Income',
+        value: CurrencyFormatter.inr(monthIncome),
+        icon: Icons.account_balance_wallet_outlined,
+        signal: incomeSignal,
+        signalLabel: monthIncome >= monthExpense ? 'covered' : 'low',
+      ),
+      _metricCard(
+        context,
+        label: 'Month-End Estimate',
+        value: CurrencyFormatter.inr(forecastSpend),
+        icon: Icons.timeline_outlined,
+        signal: estimateSignal,
+        signalLabel: forecastSpend <= monthIncome ? 'within' : 'over',
+      ),
+      _metricCard(
+        context,
+        label: 'Safe To Spend',
+        value: CurrencyFormatter.inr(snapshot.safeToSpend),
+        icon: Icons.shield_outlined,
+        signal: safeSignal,
+        signalLabel: snapshot.safeToSpend > 0 ? 'safe' : 'risk',
+      ),
+    ];
+    final List<String> spendingBullets = _spendingBullets(
+      monthIncome: monthIncome,
+      monthExpense: monthExpense,
+      forecastSpend: forecastSpend,
+      safeToSpend: snapshot.safeToSpend,
+      monthlyTrendPercent: snapshot.monthlyTrendPercent,
+    );
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: <Widget>[
+        const SectionHeader(
+          title: 'Spending Analysis',
+          subtitle: 'Real-time monthly spend + projected month-end behavior.',
+        ),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: metricCards
+              .asMap()
+              .entries
+              .map((MapEntry<int, Widget> entry) => _staggerReveal(
+                    index: entry.key,
+                    child: entry.value,
+                  ))
+              .toList(growable: false),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: spendingBullets
+                  .map((String item) => _compactTag(context, item))
+                  .toList(growable: false),
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        const SectionHeader(
+          title: 'Top Spend Categories',
+          subtitle: 'Live category split for the current month.',
+        ),
+        const SizedBox(height: 10),
+        if (topCategories.isEmpty)
+          const Card(
+            child: ListTile(
+              leading: Icon(Icons.bar_chart_outlined),
+              title: Text('No monthly spending data yet.'),
+            ),
+          )
+        else
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(10, 14, 10, 10),
+              child: SizedBox(
+                height: 220,
+                child: BarChart(
+                  duration: _animationsDisabled
+                      ? Duration.zero
+                      : const Duration(milliseconds: 420),
+                  curve: Curves.easeOutCubic,
+                  BarChartData(
+                    maxY: topCategories.first.value * 1.2,
+                    borderData: FlBorderData(show: false),
+                    gridData: FlGridData(show: false),
+                    titlesData: FlTitlesData(
+                      topTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      leftTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      rightTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      bottomTitles: AxisTitles(
+                        sideTitles: SideTitles(
+                          showTitles: true,
+                          getTitlesWidget: (double value, TitleMeta meta) {
+                            final int idx = value.toInt();
+                            if (idx < 0 || idx >= topCategories.length) {
+                              return const SizedBox.shrink();
+                            }
+                            return Padding(
+                              padding: const EdgeInsets.only(top: 6),
+                              child: Text(
+                                _shortCategory(topCategories[idx].key),
+                                style: Theme.of(context).textTheme.labelSmall,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ),
+                    barGroups: _barGroupsForCategories(topCategories),
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildSavingsTab(BuildContext context) {
+    final DashboardSnapshot snapshot = ref.watch(dashboardSnapshotProvider);
+    final List<FinanceTransaction> transactions =
+        ref.watch(transactionsProvider).value ?? const <FinanceTransaction>[];
+    final DateTime now = DateTime.now();
+    final List<FinanceTransaction> monthTransactions = _monthTransactions(
+      transactions,
+      now,
+    );
+
+    final double monthExpense = _monthExpense(monthTransactions);
+    final double baselineMonthlyExpense =
+        monthExpense > 0 ? monthExpense : snapshot.monthlySpend;
+    final double emergencyTarget = baselineMonthlyExpense * 6;
+    final double currentReserve = math.max(snapshot.totalBalance, 0);
+    final double reserveGap = math.max(emergencyTarget - currentReserve, 0);
+    final double reserveProgress = emergencyTarget <= 0
+        ? 1
+        : (currentReserve / emergencyTarget).clamp(0, 1).toDouble();
+    final double suggestedMonthlyReserve = reserveGap <= 0
+        ? 0
+        : math.max(500, reserveGap / 12);
+
+    final List<int> reserveScenarios = <int>[1000, 2000, 5000, 10000];
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: <Widget>[
+        const SectionHeader(
+          title: 'Savings Readiness',
+          subtitle: 'How much you should save before aggressive investing.',
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  'Emergency Fund Progress',
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleMedium
+                      ?.copyWith(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Current reserve: ${CurrencyFormatter.inr(currentReserve)}\n'
+                  'Target (6 months expense): ${CurrencyFormatter.inr(emergencyTarget)}\n'
+                  'Gap: ${CurrencyFormatter.inr(reserveGap)}',
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 10),
+                TweenAnimationBuilder<double>(
+                  tween: Tween<double>(begin: 0, end: reserveProgress),
+                  duration: const Duration(milliseconds: 700),
+                  curve: Curves.easeOutCubic,
+                  builder: (BuildContext context, double value, Widget? child) {
+                    return LinearProgressIndicator(value: value);
+                  },
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  reserveGap <= 0
+                      ? 'Great. You have enough reserve to start higher SIP amounts safely.'
+                      : 'Suggested reserve build amount: ${CurrencyFormatter.inr(suggestedMonthlyReserve)} per month.',
+                  style: Theme.of(context).textTheme.bodySmall,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        const SectionHeader(
+          title: 'Reserve Build Scenarios',
+          subtitle: 'Estimated time to close reserve gap for multiple monthly amounts.',
+        ),
+        const SizedBox(height: 8),
+        ...reserveScenarios.asMap().entries.map((MapEntry<int, int> entry) {
+          final int amount = entry.value;
+          final int months = reserveGap <= 0 ? 0 : (reserveGap / amount).ceil();
+          return _staggerReveal(
+            index: entry.key + 1,
+            child: Card(
+            margin: const EdgeInsets.only(bottom: 8),
+            child: ListTile(
+              leading: const Icon(Icons.savings_outlined),
+              title: Text('Save ${CurrencyFormatter.inr(amount.toDouble())} per month'),
+              subtitle: Text(
+                months == 0
+                    ? 'Reserve target already covered.'
+                    : 'Estimated completion in about $months month${months == 1 ? '' : 's'}.',
+              ),
+            ),
+            ),
+          );
+        }),
+      ],
+    );
+  }
+
+  Widget _buildInvestingTab(BuildContext context) {
+    final DashboardSnapshot snapshot = ref.watch(dashboardSnapshotProvider);
+    final List<FinanceTransaction> transactions =
+        ref.watch(transactionsProvider).value ?? const <FinanceTransaction>[];
+    final DateTime now = DateTime.now();
+    final List<FinanceTransaction> monthTransactions = _monthTransactions(
+      transactions,
+      now,
+    );
+
+    final double monthIncome = _monthIncome(monthTransactions);
+    final double monthExpense = _monthExpense(monthTransactions);
+    final double monthNet = monthIncome - monthExpense;
+    final double suggestedSipLow = monthNet <= 0 ? 0 : monthNet * 0.15;
+    final double suggestedSipHigh = monthNet <= 0 ? 0 : monthNet * 0.35;
+
+    final List<_SipProjection> projections = _sipScenarioAmounts
+        .map((int amount) => _sipProjection(
+              monthlyAmount: amount.toDouble(),
+              years: _sipYears,
+              annualReturn: _assumedAnnualReturn,
+            ))
+        .toList(growable: false);
+
+    final _SipProjection selected = _sipProjection(
+      monthlyAmount: _selectedSipAmount.toDouble(),
+      years: _sipYears,
+      annualReturn: _assumedAnnualReturn,
+    );
+
+    final _MetricSignal cashflowSignal =
+      monthNet >= 0 ? _MetricSignal.positive : _MetricSignal.negative;
+    final _MetricSignal sipFitSignal = selected.monthlyAmount <= suggestedSipHigh
+      ? _MetricSignal.positive
+      : _MetricSignal.negative;
+
+    final List<String> sipBullets = _sipBullets(
+      monthNet: monthNet,
+      suggestedSipLow: suggestedSipLow,
+      suggestedSipHigh: suggestedSipHigh,
+      selected: selected,
+      safeToSpend: snapshot.safeToSpend,
+    );
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: <Widget>[
+        const SectionHeader(
+          title: 'Stock SIP Planner',
+          subtitle: 'Real-time affordability + estimated market returns.',
+        ),
+        const SizedBox(height: 12),
+        _staggerReveal(
+          index: 0,
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text(
+                    'Live Monthly Cashflow',
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Income: ${CurrencyFormatter.inr(monthIncome)}\n'
+                    'Spend: ${CurrencyFormatter.inr(monthExpense)}\n'
+                    'Net: ${CurrencyFormatter.inr(monthNet)}',
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    monthNet <= 0
+                        ? 'You are currently cashflow-negative. Reduce spending first, then start SIP at a small amount.'
+                        : 'Suggested SIP range from current cashflow: ${CurrencyFormatter.inr(suggestedSipLow)} to ${CurrencyFormatter.inr(suggestedSipHigh)} per month.',
+                    style: Theme.of(context).textTheme.bodySmall,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: <Widget>[
+                      _signalBadge(
+                        context,
+                        label: monthNet >= 0 ? 'Cashflow positive' : 'Cashflow negative',
+                        signal: cashflowSignal,
+                      ),
+                      _signalBadge(
+                        context,
+                        label: selected.monthlyAmount <= suggestedSipHigh
+                            ? 'SIP in range'
+                            : 'SIP above range',
+                        signal: sipFitSignal,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        _staggerReveal(
+          index: 1,
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text(
+                    'Assumptions',
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Expected annual return: ${_assumedAnnualReturn.toStringAsFixed(1)}%',
+                  ),
+                  Slider(
+                    value: _assumedAnnualReturn,
+                    min: 8,
+                    max: 18,
+                    divisions: 20,
+                    label: '${_assumedAnnualReturn.toStringAsFixed(1)}%',
+                    onChanged: (double value) {
+                      setState(() {
+                        _assumedAnnualReturn = value;
+                      });
+                    },
+                  ),
+                  Text('Investment horizon: $_sipYears years'),
+                  Slider(
+                    value: _sipYears.toDouble(),
+                    min: 1,
+                    max: 25,
+                    divisions: 24,
+                    label: '$_sipYears years',
+                    onChanged: (double value) {
+                      setState(() {
+                        _sipYears = value.round();
+                      });
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        _staggerReveal(
+          index: 2,
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: _sipScenarioAmounts.map((int amount) {
+              return ChoiceChip(
+                selected: _selectedSipAmount == amount,
+                label: Text(CurrencyFormatter.inr(amount.toDouble())),
+                onSelected: (_) {
+                  setState(() {
+                    _selectedSipAmount = amount;
+                  });
+                },
+              );
+            }).toList(growable: false),
+          ),
+        ),
+        const SizedBox(height: 10),
+        _staggerReveal(
+          index: 3,
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 260),
+            transitionBuilder: (Widget child, Animation<double> animation) {
+              return FadeTransition(
+                opacity: animation,
+                child: SlideTransition(
+                  position: Tween<Offset>(
+                    begin: const Offset(0, 0.05),
+                    end: Offset.zero,
+                  ).animate(animation),
+                  child: child,
+                ),
+              );
+            },
+            child: Card(
+              key: ValueKey<String>(
+                '${selected.monthlyAmount}-$_sipYears-${_assumedAnnualReturn.toStringAsFixed(1)}',
+              ),
+              child: ListTile(
+                leading: const Icon(Icons.calculate_outlined),
+                title: Text('SIP ${CurrencyFormatter.inr(selected.monthlyAmount)} for $_sipYears years'),
+                subtitle: Text(
+                  'Invested: ${CurrencyFormatter.inr(selected.totalInvested)}\n'
+                  'Estimated corpus: ${CurrencyFormatter.inr(selected.estimatedCorpus)}\n'
+                  'Estimated gain: ${CurrencyFormatter.inr(selected.estimatedGain)}',
+                ),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        _staggerReveal(
+          index: 4,
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(10, 14, 10, 10),
+              child: SizedBox(
+                height: 220,
+                child: LineChart(
+                  duration: _animationsDisabled
+                      ? Duration.zero
+                      : const Duration(milliseconds: 450),
+                  curve: Curves.easeOutCubic,
+                  LineChartData(
+                    minX: 0,
+                    maxX: _sipYears.toDouble(),
+                    minY: 0,
+                    maxY: selected.estimatedCorpus * 1.15,
+                    gridData: FlGridData(show: false),
+                    borderData: FlBorderData(show: false),
+                    titlesData: FlTitlesData(
+                      topTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      leftTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      rightTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      bottomTitles: AxisTitles(
+                        sideTitles: SideTitles(
+                          showTitles: true,
+                          interval: _sipYears <= 6 ? 1 : 2,
+                          getTitlesWidget: (double value, TitleMeta meta) {
+                            return Text(
+                              '${value.toInt()}y',
+                              style: Theme.of(context).textTheme.labelSmall,
+                            );
+                          },
+                        ),
+                      ),
+                    ),
+                    lineBarsData: <LineChartBarData>[
+                      LineChartBarData(
+                        isCurved: true,
+                        color: Theme.of(context).colorScheme.primary,
+                        barWidth: 3,
+                        dotData: const FlDotData(show: false),
+                        spots: _sipGrowthSeries(
+                          monthlyAmount: selected.monthlyAmount,
+                          years: _sipYears,
+                          annualReturn: _assumedAnnualReturn,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        _staggerReveal(
+          index: 5,
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(10, 14, 10, 10),
+              child: SizedBox(
+                height: 220,
+                child: BarChart(
+                  duration: _animationsDisabled
+                      ? Duration.zero
+                      : const Duration(milliseconds: 450),
+                  curve: Curves.easeOutCubic,
+                  BarChartData(
+                    maxY: projections.last.estimatedCorpus * 1.2,
+                    borderData: FlBorderData(show: false),
+                    gridData: FlGridData(show: false),
+                    titlesData: FlTitlesData(
+                      topTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      leftTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      rightTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false),
+                      ),
+                      bottomTitles: AxisTitles(
+                        sideTitles: SideTitles(
+                          showTitles: true,
+                          getTitlesWidget: (double value, TitleMeta meta) {
+                            final int idx = value.toInt();
+                            if (idx < 0 || idx >= projections.length) {
+                              return const SizedBox.shrink();
+                            }
+                            return Padding(
+                              padding: const EdgeInsets.only(top: 6),
+                              child: Text(
+                                '${(projections[idx].monthlyAmount / 1000).toStringAsFixed(0)}k',
+                                style: Theme.of(context).textTheme.labelSmall,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ),
+                    barGroups: _barGroupsForSip(projections),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        _staggerReveal(
+          index: 6,
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: sipBullets
+                    .map((String item) => _compactTag(context, item))
+                    .toList(growable: false),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _compactTag(
+    BuildContext context,
+    String text, {
+    Color? color,
+  }) {
+    final Color accent = color ?? Theme.of(context).colorScheme.secondary;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: accent.withValues(alpha: 0.28)),
+      ),
+      child: Text(
+        text,
+        style: Theme.of(context).textTheme.labelMedium?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+      ),
+    );
+  }
+
+  Widget _metricCard(
+    BuildContext context, {
+    required String label,
+    required String value,
+    required IconData icon,
+    _MetricSignal signal = _MetricSignal.neutral,
+    String? signalLabel,
+  }) {
+    return Container(
+      width: 165,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Theme.of(context).dividerColor),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Icon(icon, size: 18, color: Theme.of(context).colorScheme.primary),
+              const Spacer(),
+              if (signalLabel != null)
+                _signalBadge(
+                  context,
+                  label: signalLabel,
+                  signal: signal,
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(label, style: Theme.of(context).textTheme.labelSmall),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: Theme.of(context)
+                .textTheme
+                .titleSmall
+                ?.copyWith(fontWeight: FontWeight.w700),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _signalBadge(
+    BuildContext context, {
+    required String label,
+    required _MetricSignal signal,
+  }) {
+    final Color color = switch (signal) {
+      _MetricSignal.positive => const Color(0xFF2E7D32),
+      _MetricSignal.negative => const Color(0xFFC62828),
+      _MetricSignal.neutral => const Color(0xFF546E7A),
+    };
+    final IconData icon = switch (signal) {
+      _MetricSignal.positive => Icons.trending_up_rounded,
+      _MetricSignal.negative => Icons.trending_down_rounded,
+      _MetricSignal.neutral => Icons.trending_flat_rounded,
+    };
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withValues(alpha: 0.28)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Icon(icon, size: 12, color: color),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: color,
+                  fontWeight: FontWeight.w700,
+                ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<BarChartGroupData> _barGroupsForCategories(
+    List<MapEntry<String, double>> categories,
+  ) {
+    final List<Color> colors = <Color>[
+      Colors.indigo,
+      Colors.teal,
+      Colors.orange,
+      Colors.pink,
+      Colors.green,
+    ];
+
+    return List<BarChartGroupData>.generate(categories.length, (int index) {
+      return BarChartGroupData(
+        x: index,
+        barRods: <BarChartRodData>[
+          BarChartRodData(
+            toY: categories[index].value,
+            color: colors[index % colors.length],
+            width: 16,
+            borderRadius: BorderRadius.circular(5),
+          ),
+        ],
+      );
+    });
+  }
+
+  List<BarChartGroupData> _barGroupsForSip(List<_SipProjection> projections) {
+    return List<BarChartGroupData>.generate(projections.length, (int index) {
+      final _SipProjection projection = projections[index];
+      return BarChartGroupData(
+        x: index,
+        barRods: <BarChartRodData>[
+          BarChartRodData(
+            toY: projection.estimatedCorpus,
+            color: projection.monthlyAmount == _selectedSipAmount
+                ? Colors.deepPurple
+                : Colors.deepPurple.withValues(alpha: 0.45),
+            width: 16,
+            borderRadius: BorderRadius.circular(5),
+          ),
+        ],
+      );
+    });
+  }
+
+  List<FinanceTransaction> _monthTransactions(
+    List<FinanceTransaction> transactions,
+    DateTime now,
+  ) {
+    return transactions.where((FinanceTransaction tx) {
+      return tx.transactionAt.year == now.year && tx.transactionAt.month == now.month;
+    }).toList(growable: false);
+  }
+
+  double _monthIncome(List<FinanceTransaction> transactions) {
+    return transactions
+        .where((FinanceTransaction tx) => tx.isIncome)
+        .fold<double>(0, (double sum, FinanceTransaction tx) => sum + tx.amount);
+  }
+
+  double _monthExpense(List<FinanceTransaction> transactions) {
+    return transactions
+        .where((FinanceTransaction tx) => tx.isExpense)
+        .fold<double>(0, (double sum, FinanceTransaction tx) => sum + tx.amount);
+  }
+
+  int _daysInMonth(DateTime date) {
+    final DateTime firstDayThisMonth = DateTime(date.year, date.month, 1);
+    final DateTime firstDayNextMonth = DateTime(
+      firstDayThisMonth.year,
+      firstDayThisMonth.month + 1,
+      1,
+    );
+    return firstDayNextMonth.subtract(const Duration(days: 1)).day;
+  }
+
+  List<MapEntry<String, double>> _topExpenseCategories(
+    List<FinanceTransaction> monthTransactions,
+    int limit,
+  ) {
+    final Map<String, double> categoryTotals = <String, double>{};
+    for (final FinanceTransaction tx in monthTransactions) {
+      if (!tx.isExpense) {
+        continue;
+      }
+      categoryTotals.update(
+        tx.category,
+        (double value) => value + tx.amount,
+        ifAbsent: () => tx.amount,
+      );
+    }
+
+    final List<MapEntry<String, double>> entries = categoryTotals.entries.toList()
+      ..sort((MapEntry<String, double> a, MapEntry<String, double> b) {
+        return b.value.compareTo(a.value);
+      });
+    return entries.take(limit).toList(growable: false);
+  }
+
+  _SipProjection _sipProjection({
+    required double monthlyAmount,
+    required int years,
+    required double annualReturn,
+  }) {
+    final int months = years * 12;
+    final double monthlyRate = annualReturn / 100 / 12;
+    final double invested = monthlyAmount * months;
+
+    final double corpus;
+    if (monthlyRate <= 0) {
+      corpus = invested;
+    } else {
+      final num factor = math.pow(1 + monthlyRate, months);
+      corpus = monthlyAmount * (((factor - 1) / monthlyRate) * (1 + monthlyRate));
+    }
+
+    return _SipProjection(
+      monthlyAmount: monthlyAmount,
+      totalInvested: invested,
+      estimatedCorpus: corpus,
+      estimatedGain: corpus - invested,
+    );
+  }
+
+  List<FlSpot> _sipGrowthSeries({
+    required double monthlyAmount,
+    required int years,
+    required double annualReturn,
+  }) {
+    final List<FlSpot> spots = <FlSpot>[];
+    for (int year = 0; year <= years; year++) {
+      final _SipProjection projection = _sipProjection(
+        monthlyAmount: monthlyAmount,
+        years: year,
+        annualReturn: annualReturn,
+      );
+      spots.add(FlSpot(year.toDouble(), projection.estimatedCorpus));
+    }
+    return spots;
+  }
+
+  String _shortCategory(String category) {
+    if (category.length <= 8) {
+      return category;
+    }
+    return '${category.substring(0, 8)}..';
+  }
+
+  List<String> _spendingBullets({
+    required double monthIncome,
+    required double monthExpense,
+    required double forecastSpend,
+    required double safeToSpend,
+    required double monthlyTrendPercent,
+  }) {
+    return <String>[
+      monthlyTrendPercent > 0
+          ? '+${monthlyTrendPercent.toStringAsFixed(1)}% vs last month'
+          : '-${monthlyTrendPercent.abs().toStringAsFixed(1)}% vs last month',
+      monthIncome >= monthExpense ? 'Within cashflow' : 'Above cashflow',
+      'Month-end est. ${CurrencyFormatter.inr(forecastSpend)}',
+      safeToSpend > 0
+          ? 'Safe budget ${CurrencyFormatter.inr(safeToSpend)}'
+          : 'Safe budget exhausted',
+    ];
+  }
+
+  List<String> _sipBullets({
+    required double monthNet,
+    required double suggestedSipLow,
+    required double suggestedSipHigh,
+    required _SipProjection selected,
+    required double safeToSpend,
+  }) {
+    if (monthNet <= 0) {
+      return <String>[
+        'Monthly cashflow negative',
+        'Start small SIP: ${CurrencyFormatter.inr(500)}',
+        'Cut optional spend first',
+      ];
+    }
+
+    return <String>[
+      'Suggested SIP ${CurrencyFormatter.inr(suggestedSipLow)} - ${CurrencyFormatter.inr(suggestedSipHigh)}',
+      selected.monthlyAmount <= suggestedSipHigh ? 'Selected SIP is affordable' : 'Selected SIP is aggressive',
+      'Est. corpus ${CurrencyFormatter.inr(selected.estimatedCorpus)}',
+      safeToSpend > 0
+          ? 'Keep weekly optional spend < ${CurrencyFormatter.inr(safeToSpend * 0.25)}'
+          : 'Stabilize weekly spend before increasing SIP',
+    ];
+  }
+
+  Widget _statusCard(
+    BuildContext context, {
+    required String label,
+    required String value,
+    required Color color,
+    required IconData icon,
+    required String subtitle,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withValues(alpha: 0.32)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Icon(icon, size: 14, color: color),
+              const Spacer(),
+              Text(
+                subtitle,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: color,
+                      fontWeight: FontWeight.w700,
+                    ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 260),
+            transitionBuilder: (Widget child, Animation<double> animation) {
+              return ScaleTransition(
+                scale: CurvedAnimation(
+                  parent: animation,
+                  curve: Curves.easeOutBack,
+                ),
+                child: child,
+              );
+            },
+            child: Text(
+              value,
+              key: ValueKey<String>('$label-$value'),
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w800,
+                    color: color,
+                  ),
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(label, style: Theme.of(context).textTheme.labelSmall),
+        ],
+      ),
+    );
+  }
+
+  Widget _filterChip(
+    String label,
+    _InsightFilter value, {
+    int? count,
+    IconData? icon,
+  }) {
+    final bool selected = _filter == value;
+    return AnimatedScale(
+      scale: selected ? 1.04 : 1,
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOut,
+      child: FilterChip(
+        selected: selected,
+        avatar: icon == null ? null : Icon(icon, size: 16),
+        label: Text(count == null ? label : '$label ($count)'),
+        onSelected: (bool _) {
+          setState(() {
+            _filter = value;
+          });
+        },
+      ),
+    );
+  }
+
+  Widget _staggerReveal({
+    required int index,
+    required Widget child,
+  }) {
+    if (_animationsDisabled) {
+      return child;
+    }
+    final int clampedIndex = index.clamp(0, 8);
+    final int delayMs = clampedIndex * 55;
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: Duration(milliseconds: 260 + delayMs),
+      curve: Curves.easeOutCubic,
+      child: child,
+      builder: (BuildContext context, double value, Widget? child) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, (1 - value) * 10),
+            child: child,
+          ),
+        );
+      },
+    );
+  }
+
+  void _updateUrgentPulse(bool enabled) {
+    if (_animationsDisabled) {
+      if (_isUrgentPulseRunning) {
+        _urgentPulseController.stop();
+        _urgentPulseController.value = 0;
+        _isUrgentPulseRunning = false;
+      }
+      return;
+    }
+
+    if (enabled && !_isUrgentPulseRunning) {
+      _urgentPulseController.repeat(reverse: true);
+      _isUrgentPulseRunning = true;
+      return;
+    }
+
+    if (!enabled && _isUrgentPulseRunning) {
+      _urgentPulseController.stop();
+      _urgentPulseController.value = 0;
+      _isUrgentPulseRunning = false;
+    }
+  }
+
+  Future<void> _syncFeed() async {
+    if (_isSyncingFeed) {
+      return;
+    }
+
+    if (!_animationsDisabled) {
+      _syncSpinController.repeat();
+    }
+
+    setState(() {
+      _isSyncingFeed = true;
+    });
+
+    try {
+      await ref.read(insightsControllerProvider.notifier).refreshRuleBasedInsights();
+    } finally {
+      if (mounted) {
+        _syncSpinController.stop();
+        _syncSpinController.value = 0;
+
+        setState(() {
+          _isSyncingFeed = false;
+        });
+      }
+    }
+  }
+
+  bool get _animationsDisabled =>
+      WidgetsBinding.instance.platformDispatcher.accessibilityFeatures.disableAnimations;
+
+  int _severityRank(InsightSeverity severity) {
+    switch (severity) {
+      case InsightSeverity.critical:
+        return 0;
+      case InsightSeverity.warning:
+        return 1;
+      case InsightSeverity.info:
+        return 2;
+    }
+  }
+
+  String _severityLabel(InsightSeverity severity) {
+    switch (severity) {
+      case InsightSeverity.critical:
+        return 'Urgent';
+      case InsightSeverity.warning:
+        return 'Heads-up';
+      case InsightSeverity.info:
+        return 'FYI';
+    }
+  }
+
+  String _relativeTime(DateTime createdAt) {
+    final Duration delta = DateTime.now().difference(createdAt);
+    if (delta.inMinutes < 1) {
+      return 'just now';
+    }
+    if (delta.inHours < 1) {
+      return '${delta.inMinutes}m ago';
+    }
+    if (delta.inDays < 1) {
+      return '${delta.inHours}h ago';
+    }
+    if (delta.inDays < 7) {
+      return '${delta.inDays}d ago';
+    }
+    return DateFormat('dd MMM').format(createdAt);
+  }
+
+  Widget _severityPill(BuildContext context, InsightSeverity severity) {
+    final Color color = _colorForSeverity(severity);
+    final String label = _severityLabel(severity);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withValues(alpha: 0.32)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Icon(_iconForSeverity(severity), size: 12, color: color),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: color,
+                  fontWeight: FontWeight.w700,
+                ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _actionHint(InsightSeverity severity) {
+    switch (severity) {
+      case InsightSeverity.critical:
+        return 'Act now: pause non-essential spending today';
+      case InsightSeverity.warning:
+        return 'Plan this week: tighten discretionary budget';
+      case InsightSeverity.info:
+        return 'Keep going: this trend is healthy';
+    }
+  }
+
+  IconData _iconForSeverity(InsightSeverity severity) {
+    switch (severity) {
+      case InsightSeverity.info:
+        return Icons.info;
+      case InsightSeverity.warning:
+        return Icons.warning_amber;
+      case InsightSeverity.critical:
+        return Icons.error_outline;
+    }
+  }
+
+  Color _colorForSeverity(InsightSeverity severity) {
+    switch (severity) {
+      case InsightSeverity.info:
+        return const Color(0xFF1565C0);
+      case InsightSeverity.warning:
+        return const Color(0xFFEF6C00);
+      case InsightSeverity.critical:
+        return const Color(0xFFC62828);
+    }
+  }
+}
+
+class _SipProjection {
+  const _SipProjection({
+    required this.monthlyAmount,
+    required this.totalInvested,
+    required this.estimatedCorpus,
+    required this.estimatedGain,
+  });
+
+  final double monthlyAmount;
+  final double totalInvested;
+  final double estimatedCorpus;
+  final double estimatedGain;
+}
